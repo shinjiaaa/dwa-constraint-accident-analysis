@@ -1,0 +1,6 @@
+/dasc
+/__pycache__
+/logs/
+/venv/
+/venvs/
+*.pyc
