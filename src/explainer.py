@@ -169,7 +169,7 @@ class DecisionExplainer:
         
         return explanation
     
-    def _compute_score_breakdown(
+    def compute_score_breakdown(
         self,
         candidate: Dict,
         current_state: np.ndarray,
@@ -216,3 +216,13 @@ class DecisionExplainer:
         breakdown['yaw_rate_magnitude'] = abs(yaw_rate)
         
         return breakdown
+
+    def _compute_score_breakdown(
+        self,
+        candidate: Dict,
+        current_state: np.ndarray,
+        goal: np.ndarray,
+        obstacles: List[np.ndarray]
+    ) -> Dict:
+        """Backward-compatible wrapper for internal use."""
+        return self.compute_score_breakdown(candidate, current_state, goal, obstacles)

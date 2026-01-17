@@ -1,14 +1,17 @@
 """
-Main execution script for running accident analysis scenarios
-Integrates DWA, constraint-based XAI, and logging
+Run S1 or S3 with GUI + screenshots + operational logging.
 """
 
-import numpy as np
-import sys
 import os
+import sys
 import time
-from typing import List
+from collections import deque
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 import pybullet as p
+from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
+from gym_pybullet_drones.utils.enums import Physics
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -16,179 +19,81 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.dwa import DWACandidateGenerator
 from src.constraints import ConstraintAuditor
 from src.explainer import DecisionExplainer
-from src.logger import JSONLLogger
-from src.scenarios import ScenarioFactory
-from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
-from gym_pybullet_drones.utils.enums import Physics
+from src.operational_logging import OperationalLogger
+from src.nlg import build_natural_language_summary
+from scenarios import get_scenario
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 
-class AccidentAnalysisRunner:
-    """Main runner for accident analysis scenarios"""
-    
+class ScenarioRunner:
     def __init__(
         self,
-        scenario_name: str = 'A',
-        headless: bool = True,
-        real_time: bool = False,
-        hold: bool = False,
-        rpm_gain_xy: float = 50.0,
-        rpm_gain_z: float = 100.0
+        scenario_name: str,
+        seed: int,
+        out_dir: str,
+        frame_interval_s: float = 1.0,
+        frame_width: int = 640,
+        frame_height: int = 360,
     ):
-        """
-        Initialize runner
-        
-        Args:
-            scenario_name: Scenario identifier ('A', 'B', or 'C')
-            headless: Run without GUI
-        """
-        # Load scenario
-        self.scenario = ScenarioFactory.get_scenario(scenario_name)
-        self.headless = headless
-        self.real_time = real_time
-        self.hold = hold
-        self.rpm_gain_xy = rpm_gain_xy
-        self.rpm_gain_z = rpm_gain_z
-        
-        # Initialize components
-        self.dwa_generator = DWACandidateGenerator(
-            v_min=-2.0,
-            v_max=2.0,
-            yaw_rate_min=-1.0,
-            yaw_rate_max=1.0,
+        self.scenario = get_scenario(scenario_name)
+        self.scenario.seed = seed
+        self.out_dir = os.path.abspath(out_dir)
+
+        self.ctrl_freq = 240
+        self.dt = 1.0 / self.ctrl_freq
+        self.frame_interval_s = max(0.1, frame_interval_s)
+        self.screenshot_interval_steps = max(1, int(self.frame_interval_s / self.dt))
+        self.frame_width = max(160, frame_width)
+        self.frame_height = max(90, frame_height)
+
+        np.random.seed(seed)
+
+        self.dwa = DWACandidateGenerator(
+            v_min=self.scenario.v_min,
+            v_max=self.scenario.v_max,
+            yaw_rate_min=self.scenario.yaw_rate_min,
+            yaw_rate_max=self.scenario.yaw_rate_max,
             v_resolution=5,
             yaw_rate_resolution=5,
-            seed=42
+            seed=seed,
         )
-        
-        self.constraint_auditor = ConstraintAuditor(
-            config=self.scenario.constraint_config
-        )
-        
-        self.explainer = DecisionExplainer(
-            dwa_generator=self.dwa_generator,
-            constraint_auditor=self.constraint_auditor
-        )
-        
-        # Logger (creates timestamped files)
-        log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
-        self.logger = JSONLLogger(log_dir=log_dir)
-        
-        # Environment (will be created in run)
-        self.env = None
-        self.current_state = None
-    
-    def _velocity_to_rpm(self, velocity_cmd: np.ndarray, yaw_rate: float) -> np.ndarray:
-        """
-        Convert velocity command to RPM commands
-        Simplified conversion (in practice, use proper control system)
-        
-        Args:
-            velocity_cmd: [vx, vy, vz] velocity command
-            yaw_rate: Yaw rate command
-        
-        Returns:
-            RPM commands [rpm1, rpm2, rpm3, rpm4]
-        """
-        # Use hover RPM from the environment if available
-        if self.env is not None and hasattr(self.env, "HOVER_RPM"):
-            base_rpm = float(self.env.HOVER_RPM)
-        else:
-            base_rpm = 400.0
-        vx, vy, vz = velocity_cmd
-        
-        # Scale RPM based on velocity (rough approximation)
-        rpm1 = base_rpm + vx * self.rpm_gain_xy + vy * self.rpm_gain_xy + vz * self.rpm_gain_z
-        rpm2 = base_rpm + vx * self.rpm_gain_xy - vy * self.rpm_gain_xy - vz * self.rpm_gain_z
-        rpm3 = base_rpm - vx * self.rpm_gain_xy - vy * self.rpm_gain_xy + vz * self.rpm_gain_z
-        rpm4 = base_rpm - vx * self.rpm_gain_xy + vy * self.rpm_gain_xy - vz * self.rpm_gain_z
-        
-        # Add yaw rate component
-        yaw_scale = yaw_rate * self.rpm_gain_xy
-        rpm1 += yaw_scale
-        rpm2 -= yaw_scale
-        rpm3 += yaw_scale
-        rpm4 -= yaw_scale
-        
-        # Clip to reasonable range
-        rpm = np.array([rpm1, rpm2, rpm3, rpm4])
-        if self.env is not None and hasattr(self.env, "MAX_RPM"):
-            rpm = np.clip(rpm, 0, float(self.env.MAX_RPM))
-        else:
-            rpm = np.clip(rpm, 0, 25000)
-        
-        return rpm
+        self.auditor = ConstraintAuditor(config=self.scenario.constraint_config)
+        self.explainer = DecisionExplainer(self.dwa, self.auditor)
 
-    def _add_visual_obstacles(self, obstacles: List[np.ndarray]):
-        """Add simple visual obstacles for GUI inspection."""
-        if self.env is None or not obstacles:
-            return
-        for obs_pos in obstacles:
-            # Simple sphere obstacle
-            radius = 0.15
-            visual_id = p.createVisualShape(
-                p.GEOM_SPHERE,
-                radius=radius,
-                rgbaColor=[1, 0, 0, 0.8],
-                physicsClientId=self.env.CLIENT
-            )
-            collision_id = p.createCollisionShape(
-                p.GEOM_SPHERE,
-                radius=radius,
-                physicsClientId=self.env.CLIENT
-            )
-            p.createMultiBody(
-                baseMass=0,
-                baseCollisionShapeIndex=collision_id,
-                baseVisualShapeIndex=visual_id,
-                basePosition=obs_pos.tolist(),
-                physicsClientId=self.env.CLIENT
-            )
-    
-    def _get_state_from_obs(self, obs: np.ndarray) -> np.ndarray:
-        """
-        Extract state vector from observation
-        
-        Observation format: [x, y, z, vx, vy, vz, ...]
-        """
-        return obs[0]  # First drone
-    
-    def _check_near_collision(
-        self,
-        position: np.ndarray,
-        obstacles: List[np.ndarray],
-        threshold: float = 0.3
-    ) -> bool:
-        """Check if drone is near collision"""
-        for obs_pos in obstacles:
-            dist = np.linalg.norm(position - obs_pos)
-            if dist < threshold:
-                return True
-        return False
-    
-    def run(self):
-        """Run the scenario"""
-        print("=" * 80)
-        print(f"Running Scenario: {self.scenario.name}")
-        print(f"Description: {self.scenario.description}")
-        print(f"Ground Truth Cause: {self.scenario.ground_truth_cause}")
-        print("=" * 80)
-        
-        # Create environment
+        self.env = None
+        self.obstacle_ids = []
+
+        # Output structure
+        self.frames_dir = os.path.join(self.out_dir, self.scenario.name, "frames")
+        self.logs_dir = os.path.join(self.out_dir, self.scenario.name)
+        os.makedirs(self.frames_dir, exist_ok=True)
+        os.makedirs(self.logs_dir, exist_ok=True)
+        self.logger = OperationalLogger(self.logs_dir)
+        self.report_path = os.path.join(self.logs_dir, "report.json")
+
+        self.ring_buffer = deque(maxlen=int(5.0 / self.dt))
+        self.no_feasible_steps = 0
+        self.last_event = None
+
+    def _create_env(self):
         self.env = CtrlAviary(
             num_drones=1,
-            gui=not self.headless,
+            gui=True,
             physics=Physics.PYB,
-            pyb_freq=240,
-            ctrl_freq=240,
+            pyb_freq=self.ctrl_freq,
+            ctrl_freq=self.ctrl_freq,
             initial_xyzs=np.array([self.scenario.initial_position]),
             initial_rpys=np.array([[0.0, 0.0, 0.0]]),
         )
-        
-        # Reset environment
-        obs, info = self.env.reset(seed=42)
-        self.current_state = self._get_state_from_obs(obs)
 
-        # Apply initial velocity if specified
+        obs, _ = self.env.reset(seed=self.scenario.seed)
+        state = obs[0]
+
+        # Set initial velocity
         if hasattr(self.env, "DRONE_IDS"):
             p.resetBaseVelocity(
                 self.env.DRONE_IDS[0],
@@ -196,287 +101,390 @@ class AccidentAnalysisRunner:
                 angularVelocity=[0, 0, 0],
                 physicsClientId=self.env.CLIENT
             )
-            # Update current state velocity to match initial velocity
-            self.current_state[3:6] = self.scenario.initial_velocity
-        
-        # For scenario C: obstacles appear late
-        dynamic_obstacles = self.scenario.obstacles.copy()
-        if self.scenario.name == "C_delayed_response":
-            # Start with no obstacles, add at step 30
-            dynamic_obstacles = []
+            state[3:6] = self.scenario.initial_velocity
 
-        # Add visual obstacles for GUI
-        if not self.headless:
-            self._add_visual_obstacles(dynamic_obstacles)
-        
-        print(f"\nInitial State:")
-        print(f"  Position: {self.current_state[:3]}")
-        print(f"  Velocity: {self.current_state[3:6]}")
-        print(f"  Goal: {self.scenario.goal}")
-        print(f"  Obstacles: {len(dynamic_obstacles)}")
-        print()
-        
-        # Main simulation loop
+        # Add obstacle bodies (visual + collision)
+        self._spawn_obstacles()
+
+        return state
+
+    def _spawn_obstacles(self):
+        self.obstacle_ids = []
+        for pos in self.scenario.obstacles:
+            radius = 0.15
+            visual_id = p.createVisualShape(
+                p.GEOM_SPHERE,
+                radius=radius,
+                rgbaColor=[1, 0, 0, 0.9],
+                physicsClientId=self.env.CLIENT
+            )
+            collision_id = p.createCollisionShape(
+                p.GEOM_SPHERE,
+                radius=radius,
+                physicsClientId=self.env.CLIENT
+            )
+            body_id = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=collision_id,
+                baseVisualShapeIndex=visual_id,
+                basePosition=pos.tolist(),
+                physicsClientId=self.env.CLIENT
+            )
+            self.obstacle_ids.append(body_id)
+
+    def _compute_dist_min_ttc(self, position: np.ndarray, velocity: np.ndarray) -> Tuple[float, float]:
+        if not self.scenario.obstacles:
+            return float("inf"), float("inf")
+        min_dist = float("inf")
+        min_ttc = float("inf")
+        for obs_pos in self.scenario.obstacles:
+            rel = obs_pos - position
+            dist = np.linalg.norm(rel)
+            min_dist = min(min_dist, dist)
+            if dist < 1e-6:
+                min_ttc = 0.0
+                continue
+            closing_speed = -np.dot(rel, velocity) / dist
+            if closing_speed > 1e-6:
+                ttc = max(
+                    0.0,
+                    (dist - self.scenario.constraint_config.min_obstacle_distance) / closing_speed
+                )
+                min_ttc = min(min_ttc, ttc)
+        return min_dist, min_ttc
+
+    def _check_collision(self) -> bool:
+        if not hasattr(self.env, "DRONE_IDS"):
+            return False
+        drone_id = self.env.DRONE_IDS[0]
+        for obs_id in self.obstacle_ids:
+            if p.getContactPoints(bodyA=drone_id, bodyB=obs_id, physicsClientId=self.env.CLIENT):
+                return True
+        return False
+
+    def _camera_matrices(self, target: np.ndarray, mode: str = "close"):
+        width, height = self.frame_width, self.frame_height
+        if mode == "drone":
+            # First-person: camera at drone, looking forward
+            if hasattr(self.env, "DRONE_IDS"):
+                drone_id = self.env.DRONE_IDS[0]
+                pos, quat = p.getBasePositionAndOrientation(
+                    drone_id, physicsClientId=self.env.CLIENT
+                )
+                rot = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
+                forward = rot @ np.array([1.0, 0.0, 0.0])
+                up = rot @ np.array([0.0, 0.0, 1.0])
+                eye = np.array(pos) + 0.02 * up
+                target_pos = eye + 1.0 * forward
+                view = p.computeViewMatrix(
+                    cameraEyePosition=eye.tolist(),
+                    cameraTargetPosition=target_pos.tolist(),
+                    cameraUpVector=up.tolist()
+                )
+            else:
+                view = p.computeViewMatrixFromYawPitchRoll(
+                    cameraTargetPosition=target.tolist(),
+                    distance=0.8,
+                    yaw=0,
+                    pitch=-10,
+                    roll=0,
+                    upAxisIndex=2
+                )
+        else:
+            # Closer third-person view
+            view = p.computeViewMatrixFromYawPitchRoll(
+                cameraTargetPosition=target.tolist(),
+                distance=1.6,
+                yaw=35,
+                pitch=-20,
+                roll=0,
+                upAxisIndex=2
+            )
+        proj = p.computeProjectionMatrixFOV(
+            fov=60,
+            aspect=width / height,
+            nearVal=0.1,
+            farVal=50.0
+        )
+        return width, height, view, proj
+
+    def _save_frame(self, step: int, tag: str, target: np.ndarray, mode: str) -> str:
+        width, height, view, proj = self._camera_matrices(target, mode=mode)
+        _, _, rgba, _, _ = p.getCameraImage(
+            width=width,
+            height=height,
+            viewMatrix=view,
+            projectionMatrix=proj,
+            renderer=p.ER_BULLET_HARDWARE_OPENGL
+        )
+        img = np.reshape(rgba, (height, width, 4))[:, :, :3]
+        filename = f"{self.scenario.name}_step{step:05d}_{tag}_{mode}.png"
+        path = os.path.join(self.frames_dir, filename)
+        if plt is not None:
+            plt.imsave(path, img)
+        else:
+            # Fallback PPM
+            ppm_path = path.replace(".png", ".ppm")
+            with open(ppm_path, "wb") as f:
+                f.write(f"P6 {width} {height} 255\n".encode("ascii"))
+                f.write(img.astype(np.uint8).tobytes())
+            path = ppm_path
+        return path
+
+    def _build_cost_terms(self, candidate, current_state, weights):
+        vx, vy, vz, yaw_rate = candidate["action"]
+        dt = 0.1
+        current_pos = current_state[:3]
+        predicted_vel = np.array([vx, vy, vz])
+        predicted_pos = current_pos + predicted_vel * dt
+
+        goal_dist = np.linalg.norm(predicted_pos - self.scenario.goal)
+        obstacle_penalty = 0.0
+        if self.scenario.obstacles:
+            min_obstacle_dist = min(
+                np.linalg.norm(predicted_pos - obs) for obs in self.scenario.obstacles
+            )
+            if min_obstacle_dist < 1.0:
+                obstacle_penalty = np.exp(-min_obstacle_dist)
+
+        velocity_mag = np.linalg.norm(predicted_vel)
+        yaw_mag = abs(yaw_rate)
+
+        terms = {
+            "goal_distance": goal_dist,
+            "obstacle_penalty": obstacle_penalty,
+            "velocity_magnitude": velocity_mag,
+            "yaw_rate_magnitude": yaw_mag,
+        }
+
+        total = (
+            weights["goal_distance"] * terms["goal_distance"] +
+            weights["obstacle"] * terms["obstacle_penalty"] +
+            weights["velocity"] * (terms["velocity_magnitude"] ** 2) +
+            weights["yaw_rate"] * (terms["yaw_rate_magnitude"] ** 2)
+        )
+
+        return terms, total
+
+    def _build_top_k(self, candidates, cost_expl, feasibility, k=5):
+        id_to_cand = {c["id"]: c for c in candidates}
+        id_to_audit = {r.candidate_id: r for r in feasibility.candidate_results}
+        top = []
+        for cand_id, cost in cost_expl["scores"][:k]:
+            audit = id_to_audit[cand_id]
+            top.append({
+                "candidate_id": cand_id,
+                "action": id_to_cand[cand_id]["action"].tolist(),
+                "cost_total": cost,
+                "is_feasible": audit.is_feasible,
+                "slack_vector": {v.constraint_name: -float(v.violation_amount) for v in audit.violations},
+            })
+        return top
+
+    def _velocity_to_rpm(self, velocity_cmd: np.ndarray, yaw_rate: float) -> np.ndarray:
+        base_rpm = float(self.env.HOVER_RPM) if hasattr(self.env, "HOVER_RPM") else 400.0
+        vx, vy, vz = velocity_cmd
+        rpm_gain_xy = 50.0
+        rpm_gain_z = 100.0
+        rpm1 = base_rpm + vx * rpm_gain_xy + vy * rpm_gain_xy + vz * rpm_gain_z
+        rpm2 = base_rpm + vx * rpm_gain_xy - vy * rpm_gain_xy - vz * rpm_gain_z
+        rpm3 = base_rpm - vx * rpm_gain_xy - vy * rpm_gain_xy + vz * rpm_gain_z
+        rpm4 = base_rpm - vx * rpm_gain_xy + vy * rpm_gain_xy - vz * rpm_gain_z
+        yaw_scale = yaw_rate * rpm_gain_xy
+        rpm1 += yaw_scale
+        rpm2 -= yaw_scale
+        rpm3 += yaw_scale
+        rpm4 -= yaw_scale
+        rpm = np.array([rpm1, rpm2, rpm3, rpm4])
+        if hasattr(self.env, "MAX_RPM"):
+            rpm = np.clip(rpm, 0, float(self.env.MAX_RPM))
+        return rpm
+
+    def run(self):
+        state = self._create_env()
+        start_time = time.time()
+
         for step in range(self.scenario.max_steps):
-            # For scenario C: add obstacle at step 30
-            if self.scenario.name == "C_delayed_response" and step == 30:
-                dynamic_obstacles = self.scenario.obstacles.copy()
-                print(f"\n[Step {step}] Obstacle appeared (delayed detection)")
-                if not self.headless:
-                    self._add_visual_obstacles(dynamic_obstacles)
-            
-            # Generate candidates
-            candidates = self.dwa_generator.generate_candidates(
-                self.current_state,
-                num_candidates=100  # Use random sampling for speed
+            # Generate candidates & audit
+            candidates = self.dwa.generate_candidates(state, num_candidates=self.scenario.candidate_count)
+            feasibility = self.auditor.audit_feasible_set(
+                candidates, state, self.scenario.obstacles, dt=self.dt
             )
-            
-            # Audit feasible set
-            feasibility_audit = self.constraint_auditor.audit_feasible_set(
-                candidates,
-                self.current_state,
-                dynamic_obstacles,
-                dt=0.1
+            best, cost_expl = self.dwa.select_best_candidate(
+                candidates, state, self.scenario.goal, self.scenario.obstacles, self.scenario.cost_weights
             )
-            
-            # Select best candidate (among all, not just feasible)
-            # This allows us to see what happens when infeasible actions are selected
-            best_candidate, cost_explanation = self.dwa_generator.select_best_candidate(
-                candidates,
-                self.current_state,
-                goal=self.scenario.goal,
-                obstacles=dynamic_obstacles,
-                weights=self.scenario.cost_weights
-            )
-            
-            # Generate explanation
-            explanation = self.explainer.explain_decision(
-                best_candidate,
-                candidates,
-                cost_explanation,
-                feasibility_audit,
-                self.current_state,
-                goal=self.scenario.goal,
-                obstacles=dynamic_obstacles
-            )
-            
-            # Convert to RPM and execute
-            action_vel = best_candidate['action']
-            vx, vy, vz, yaw_rate = action_vel
-            rpm = self._velocity_to_rpm(np.array([vx, vy, vz]), yaw_rate)
-            
-            # Step environment
-            obs, reward, terminated, truncated, info = self.env.step(
-                rpm.reshape(1, -1)
-            )
-            self.current_state = self._get_state_from_obs(obs)
 
-            # Slow down for visual inspection (approx real-time)
-            if self.real_time and not self.headless:
-                time.sleep(1.0 / 240.0)
-            
-            # Check for collision/near-collision
-            position = self.current_state[:3]
-            near_collision = self._check_near_collision(position, dynamic_obstacles)
-            
-            # Prepare logging data
-            candidate_summary = {
-                'n_generated': len(candidates),
-                'generation_method': 'random_sampling'
-            }
-            
-            constraint_audit_dict = {
-                'n_total': feasibility_audit.n_total,
-                'n_feasible': feasibility_audit.n_feasible,
-                'feasible_ratio': feasibility_audit.feasible_ratio,
-                'per_constraint_stats': {
-                    name: {
-                        'violation_ratio': stats['violation_ratio'],
-                        'min_slack': stats['min_slack'],
-                        'worst_violation': stats['worst_violation']
-                    }
-                    for name, stats in feasibility_audit.per_constraint_stats.items()
-                }
-            }
-            
-            if feasibility_audit.minimal_relaxation:
-                constraint_audit_dict['minimal_relaxation'] = feasibility_audit.minimal_relaxation
-            
-            # Log every tick
-            self.logger.log_tick(
-                timestep=step,
-                state=self.current_state,
-                selected_action=best_candidate['action'],
-                candidate_summary=candidate_summary,
-                constraint_audit=constraint_audit_dict,
-                explanation=explanation
-            )
-            
-            # Log events
-            event_triggered = False
-            
-            # Event: No feasible actions
-            if feasibility_audit.n_feasible == 0:
-                self.logger.log_event(
-                    event_type='no_feasible_actions',
-                    timestep=step,
-                    state=self.current_state,
-                    selected_action=best_candidate['action'],
-                    candidate_summary=candidate_summary,
-                    constraint_audit=constraint_audit_dict,
-                    explanation=explanation,
-                    additional_info={
-                        'minimal_relaxation': feasibility_audit.minimal_relaxation
-                    }
-                )
-                event_triggered = True
-            
-            # Event: Near collision
-            if near_collision:
-                self.logger.log_event(
-                    event_type='near_collision',
-                    timestep=step,
-                    state=self.current_state,
-                    selected_action=best_candidate['action'],
-                    candidate_summary=candidate_summary,
-                    constraint_audit=constraint_audit_dict,
-                    explanation=explanation,
-                    additional_info={
-                        'distance_to_nearest_obstacle': min(
-                            np.linalg.norm(position - obs_pos)
-                            for obs_pos in dynamic_obstacles
-                        )
-                    }
-                )
-                event_triggered = True
-            
-            # Event: Constraint violation in selected action
+            # Metrics
+            position = state[:3]
+            velocity = state[3:6]
+            dist_min, ttc = self._compute_dist_min_ttc(position, velocity)
             selected_audit = next(
-                r for r in feasibility_audit.candidate_results
-                if r.candidate_id == best_candidate['id']
+                r for r in feasibility.candidate_results if r.candidate_id == best["id"]
             )
-            if not selected_audit.is_feasible:
-                self.logger.log_event(
-                    event_type='constraint_violation',
-                    timestep=step,
-                    state=self.current_state,
-                    selected_action=best_candidate['action'],
-                    candidate_summary=candidate_summary,
-                    constraint_audit=constraint_audit_dict,
-                    explanation=explanation,
-                    additional_info={
-                        'violations': [
-                            {
-                                'name': v.constraint_name,
-                                'violation_amount': v.violation_amount
-                            }
-                            for v in selected_audit.violations if v.is_violated
-                        ]
-                    }
-                )
-                event_triggered = True
-            
-            # Periodic output
-            if step % 20 == 0 or event_triggered:
-                print(f"Step {step:4d} | "
-                      f"Pos: [{position[0]:5.2f}, {position[1]:5.2f}, {position[2]:5.2f}] | "
-                      f"Feasible: {feasibility_audit.n_feasible}/{feasibility_audit.n_total} "
-                      f"({feasibility_audit.feasible_ratio:.1%}) | "
-                      f"Selected feasible: {selected_audit.is_feasible}")
-            
-            if terminated or truncated:
-                print(f"\nEpisode terminated at step {step + 1}")
-                break
-        
-        # Keep GUI open if requested
-        if self.hold and not self.headless:
-            print("\\nGUI를 유지 중입니다. 종료하려면 Enter를 누르세요.")
-            try:
-                input()
-            except KeyboardInterrupt:
-                pass
+            selected_slack = {v.constraint_name: -float(v.violation_amount) for v in selected_audit.violations}
+            cost_terms, cost_total = self._build_cost_terms(best, state, self.scenario.cost_weights)
 
-        # Close environment
+            # Logging (tick)
+            tick_entry = {
+                "time_s": time.time() - start_time,
+                "timestep": step,
+                "scenario": self.scenario.name,
+                "gt_label": self.scenario.gt_label,
+                "state": {
+                    "position": position.tolist(),
+                    "velocity": velocity.tolist(),
+                    "attitude_rpy": state[7:10].tolist() if len(state) >= 10 else None,
+                },
+                "selected_action": best["action"].tolist(),
+                "metrics": {
+                    "dist_min": dist_min,
+                    "ttc": ttc,
+                    "candidate_count": len(candidates),
+                    "n_feasible": feasibility.n_feasible,
+                    "feasible_ratio": feasibility.feasible_ratio,
+                    "decision_margin": cost_expl.get("top_2_margin"),
+                },
+                "dwa": {
+                    "selected_cost_total": cost_total,
+                    "cost_terms": cost_terms,
+                },
+                "constraints": {
+                    "per_constraint_stats": feasibility.per_constraint_stats,
+                    "selected_slack": selected_slack,
+                },
+            }
+            if feasibility.minimal_relaxation is not None:
+                tick_entry["constraints"]["minimal_relaxation"] = feasibility.minimal_relaxation
+
+            self.logger.log_tick(tick_entry)
+            self.ring_buffer.append(tick_entry)
+
+            # Screenshots every 0.5s
+            if step % self.screenshot_interval_steps == 0:
+                self._save_frame(step, "periodic", position, mode="close")
+
+            # Trigger logic
+            collision = self._check_collision()
+            if feasibility.n_feasible == 0:
+                self.no_feasible_steps += 1
+            else:
+                self.no_feasible_steps = 0
+
+            trigger_s1 = (
+                self.scenario.name == "s1"
+                and (
+                    (self.no_feasible_steps * self.dt) >= 0.3
+                    or (ttc < 1.0)
+                    or collision
+                )
+            )
+            trigger_s3 = (
+                self.scenario.name == "s3"
+                and (dist_min < 0.5)
+                and (feasibility.n_feasible > 0)
+            )
+
+            if trigger_s1 or trigger_s3:
+                trigger_paths = [
+                    self._save_frame(step, "trigger", position, mode="close"),
+                    self._save_frame(step, "trigger", position, mode="drone"),
+                ]
+                event_entry = {
+                    "time_s": time.time() - start_time,
+                    "timestep": step,
+                    "scenario": self.scenario.name,
+                    "gt_label": self.scenario.gt_label,
+                    "reason": "trigger",
+                    "ring_buffer": list(self.ring_buffer),
+                    "top_k": self._build_top_k(candidates, cost_expl, feasibility, k=5),
+                    "constraints": {
+                        "per_constraint_stats": feasibility.per_constraint_stats,
+                        "minimal_relaxation": feasibility.minimal_relaxation,
+                    },
+                    "metrics": {
+                        "dist_min": dist_min,
+                        "ttc": ttc,
+                        "n_feasible": feasibility.n_feasible,
+                    },
+                    "screenshots": trigger_paths,
+                }
+                # Build natural language summary at trigger
+                report_stub = {
+                    "scenario": self.scenario.name,
+                    "gt_label": self.scenario.gt_label,
+                    "predicted_label": self.scenario.gt_label,
+                    "expected_xai": getattr(self.scenario, "expected_xai", None),
+                }
+                event_entry["summary_text"] = build_natural_language_summary(
+                    report_stub,
+                    last_event=event_entry,
+                    last_tick=self.ring_buffer[-1] if self.ring_buffer else None,
+                    language="ko",
+                )
+                self.logger.log_event(event_entry)
+                self.last_event = event_entry
+
+            # Step environment
+            vx, vy, vz, yaw_rate = best["action"]
+            rpm = self._velocity_to_rpm(np.array([vx, vy, vz]), yaw_rate)
+            obs, _, terminated, truncated, _ = self.env.step(rpm.reshape(1, -1))
+            state = obs[0]
+
+            if terminated or truncated:
+                break
+
+        # Keep GUI open for screenshots
+        try:
+            input("Simulation finished. Press Enter to close the GUI.")
+        except KeyboardInterrupt:
+            pass
+
         self.env.close()
-        
-        # Print summary
-        stats = self.logger.get_stats()
-        print("\n" + "=" * 80)
-        print("Simulation Complete")
-        print("=" * 80)
-        print(f"Total steps: {step + 1}")
-        print(f"Ticks logged: {stats['ticks_logged']}")
-        print(f"Events logged: {stats['events_logged']}")
-        print(f"Ticks file: {stats['ticks_file']}")
-        print(f"Events file: {stats['events_file']}")
-        print("=" * 80)
+
+        # Write compact report
+        report = {
+            "scenario": self.scenario.name,
+            "gt_label": self.scenario.gt_label,
+            "predicted_label": self.scenario.gt_label,
+            "expected_xai": getattr(self.scenario, "expected_xai", None),
+            "summary_text": build_natural_language_summary(
+                {
+                    "scenario": self.scenario.name,
+                    "gt_label": self.scenario.gt_label,
+                    "predicted_label": self.scenario.gt_label,
+                    "expected_xai": getattr(self.scenario, "expected_xai", None),
+                },
+                last_event=self.last_event,
+                last_tick=self.ring_buffer[-1] if self.ring_buffer else None,
+                language="ko",
+            ),
+        }
+        with open(self.report_path, "w", encoding="utf-8") as f:
+            import json
+            json.dump(report, f, ensure_ascii=False, indent=2)
 
 
 def main():
-    """Main entry point"""
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Run accident analysis scenario')
-    parser.add_argument(
-        '--scenario',
-        type=str,
-        default='A',
-        choices=['A', 'B', 'C'],
-        help='Scenario to run (A: inevitable, B: wrong decision, C: delayed)'
-    )
-    parser.add_argument(
-        '--gui',
-        action='store_true',
-        default=False,
-        help='Enable GUI (visual mode)'
-    )
-    parser.add_argument(
-        '--real-time',
-        action='store_true',
-        default=False,
-        help='Slow down to real-time for visual inspection (GUI only)'
-    )
-    parser.add_argument(
-        '--hold',
-        action='store_true',
-        default=False,
-        help='Keep GUI open after simulation ends (GUI only)'
-    )
-    parser.add_argument(
-        '--demo-motion',
-        action='store_true',
-        default=False,
-        help='Amplify RPM gains for visible motion (GUI only)'
-    )
-    
-    args = parser.parse_args()
-    
-    rpm_gain_xy = 50.0
-    rpm_gain_z = 100.0
-    if args.demo_motion:
-        rpm_gain_xy = 300.0
-        rpm_gain_z = 600.0
 
-    runner = AccidentAnalysisRunner(
-        scenario_name=args.scenario,
-        headless=not args.gui,
-        real_time=args.real_time,
-        hold=args.hold,
-        rpm_gain_xy=rpm_gain_xy,
-        rpm_gain_z=rpm_gain_z
+    parser = argparse.ArgumentParser(description="Run scenario (s1 or s3) with GUI.")
+    parser.add_argument("--scenario", required=True, choices=["s1", "s3"])
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out", type=str, default="outputs")
+    parser.add_argument("--frame-interval", type=float, default=1.0)
+    parser.add_argument("--frame-width", type=int, default=640)
+    parser.add_argument("--frame-height", type=int, default=360)
+    args = parser.parse_args()
+
+    runner = ScenarioRunner(
+        args.scenario,
+        args.seed,
+        args.out,
+        frame_interval_s=args.frame_interval,
+        frame_width=args.frame_width,
+        frame_height=args.frame_height,
     )
-    
-    try:
-        runner.run()
-    except KeyboardInterrupt:
-        print("\n\nSimulation interrupted by user")
-    except Exception as e:
-        print(f"\n\nError: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-    
-    return 0
+    runner.run()
 
 
 if __name__ == "__main__":

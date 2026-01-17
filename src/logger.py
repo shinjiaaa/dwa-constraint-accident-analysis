@@ -33,6 +33,7 @@ class JSONLLogger:
         
         self.tick_count = 0
         self.event_count = 0
+        self.run_id = timestamp
     
     def log_tick(
         self,
@@ -41,7 +42,8 @@ class JSONLLogger:
         selected_action: np.ndarray,
         candidate_summary: Dict,
         constraint_audit: Dict,
-        explanation: Dict
+        explanation: Dict,
+        extra: Optional[Dict] = None
     ):
         """
         Log every simulation timestep
@@ -82,6 +84,9 @@ class JSONLLogger:
         # Add minimal relaxation if present
         if 'minimal_relaxation' in constraint_audit:
             log_entry['constraint_audit']['minimal_relaxation'] = constraint_audit['minimal_relaxation']
+
+        if extra:
+            log_entry.update(extra)
         
         self._write_jsonl(self.ticks_file, log_entry)
         self.tick_count += 1
@@ -95,7 +100,8 @@ class JSONLLogger:
         candidate_summary: Dict,
         constraint_audit: Dict,
         explanation: Dict,
-        additional_info: Optional[Dict] = None
+        additional_info: Optional[Dict] = None,
+        extra: Optional[Dict] = None
     ):
         """
         Log critical events only
@@ -142,6 +148,9 @@ class JSONLLogger:
         
         if additional_info:
             log_entry['additional_info'] = additional_info
+
+        if extra:
+            log_entry.update(extra)
         
         self._write_jsonl(self.events_file, log_entry)
         self.event_count += 1
@@ -164,6 +173,20 @@ class JSONLLogger:
             'ticks_file': self.ticks_file,
             'events_file': self.events_file
         }
+
+    def log_tick_entry(self, entry: Dict):
+        """Log a prebuilt tick entry."""
+        self._write_jsonl(self.ticks_file, entry)
+        self.tick_count += 1
+
+    def log_event_entry(self, entry: Dict):
+        """Log a prebuilt event entry."""
+        self._write_jsonl(self.events_file, entry)
+        self.event_count += 1
+
+    def get_run_id(self) -> str:
+        """Get run identifier (timestamp)."""
+        return self.run_id
 
 
 def convert_numpy_types(obj):

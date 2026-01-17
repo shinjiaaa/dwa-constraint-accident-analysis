@@ -1,6 +1,7 @@
 /dasc
 /__pycache__
 /logs/
+/outputs/
 /venv/
 /venvs/
 *.pyc

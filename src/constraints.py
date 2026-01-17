@@ -17,6 +17,11 @@ class ConstraintConfig:
     max_velocity: float = 3.0  # m/s
     min_altitude: float = 0.1  # meters (above ground)
     max_altitude: float = 10.0  # meters
+    # Optional geofence (None = disabled)
+    geofence_min_x: Optional[float] = None
+    geofence_max_x: Optional[float] = None
+    geofence_min_y: Optional[float] = None
+    geofence_max_y: Optional[float] = None
 
 
 @dataclass
@@ -217,6 +222,46 @@ class ConstraintAuditor:
             threshold=0.0,  # Composite constraint
             is_violated=is_violated
         )
+
+    def check_geofence(
+        self,
+        position: np.ndarray
+    ) -> Optional[ConstraintViolation]:
+        """
+        Check geofence bounds (if configured).
+
+        Slack is the minimum margin to any boundary (positive inside, negative outside).
+        """
+        if (
+            self.config.geofence_min_x is None
+            and self.config.geofence_max_x is None
+            and self.config.geofence_min_y is None
+            and self.config.geofence_max_y is None
+        ):
+            return None
+
+        x, y = position[0], position[1]
+
+        margins = []
+        if self.config.geofence_min_x is not None:
+            margins.append(x - self.config.geofence_min_x)
+        if self.config.geofence_max_x is not None:
+            margins.append(self.config.geofence_max_x - x)
+        if self.config.geofence_min_y is not None:
+            margins.append(y - self.config.geofence_min_y)
+        if self.config.geofence_max_y is not None:
+            margins.append(self.config.geofence_max_y - y)
+
+        # Slack is minimum margin to any boundary
+        slack = min(margins) if margins else float("inf")
+        violation_amount = -slack  # Positive if outside
+
+        return ConstraintViolation(
+            constraint_name="geofence",
+            violation_amount=violation_amount,
+            threshold=0.0,
+            is_violated=(slack < 0)
+        )
     
     def audit_candidate(
         self,
@@ -255,6 +300,9 @@ class ConstraintAuditor:
         violations.append(self.check_yaw_rate(yaw_rate))
         violations.append(self.check_velocity(target_velocity))
         violations.append(self.check_altitude(predicted_pos))
+        geofence_violation = self.check_geofence(predicted_pos)
+        if geofence_violation is not None:
+            violations.append(geofence_violation)
         
         # Determine feasibility
         is_feasible = all(not v.is_violated for v in violations)
