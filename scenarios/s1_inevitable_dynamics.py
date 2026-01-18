@@ -24,6 +24,8 @@ class ScenarioConfig:
     initial_velocity: np.ndarray
     goal: np.ndarray
     obstacles: list
+    obstacle_shape: str
+    obstacle_size: dict
     constraint_config: ConstraintConfig
     cost_weights: dict
 
@@ -53,6 +55,9 @@ def build_s1() -> ScenarioConfig:
         obstacles=[
             np.array([2.0, 0.0, 1.0]),
         ],
+        # Large wall to make failure visually obvious
+        obstacle_shape="wall",
+        obstacle_size={"half_extents": [0.05, 1.2, 0.6]},
         constraint_config=ConstraintConfig(
             min_obstacle_distance=0.6,
             max_acceleration=1.0,

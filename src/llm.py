@@ -55,20 +55,17 @@ def build_llm_prompt(
 
 def call_openai_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
     """
-    Call OpenAI Responses API with the given prompt.
+    Call OpenAI Chat Completions API with the given prompt.
     """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return "[LLM] OPENAI_API_KEY가 설정되지 않았습니다."
 
-    url = "https://api.openai.com/v1/responses"
+    url = "https://api.openai.com/v1/chat/completions"
     body = {
         "model": model,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt}],
-            }
+        "messages": [
+            {"role": "user", "content": prompt}
         ],
         "temperature": 0.2,
     }
@@ -82,17 +79,18 @@ def call_openai_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
         with urlopen(req, timeout=30) as resp:
             resp_data = json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
-        return f"[LLM] HTTPError: {e.code}"
+        try:
+            err_body = e.read().decode("utf-8")
+        except Exception:
+            err_body = ""
+        return f"[LLM] HTTPError: {e.code} {err_body}"
     except URLError as e:
         return f"[LLM] URLError: {e.reason}"
     except Exception as e:
         return f"[LLM] Error: {e}"
 
-    # Try to extract output text
-    if "output_text" in resp_data:
-        return resp_data["output_text"]
-    # Fallback for nested format
+    # Extract output text
     try:
-        return resp_data["output"][0]["content"][0]["text"]
+        return resp_data["choices"][0]["message"]["content"]
     except Exception:
         return "[LLM] 응답 파싱 실패"

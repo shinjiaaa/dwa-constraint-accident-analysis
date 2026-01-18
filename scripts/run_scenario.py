@@ -2,6 +2,7 @@
 Run S1 or S3 with GUI + screenshots + operational logging.
 """
 
+import json
 import os
 import sys
 import time
@@ -42,11 +43,17 @@ class ScenarioRunner:
         frame_height: int = 360,
         llm: bool = False,
         llm_model: str = "gpt-4o-mini",
+        gui: bool = True,
+        config_path: Optional[str] = None,
     ):
-        load_dotenv()
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        load_dotenv(os.path.join(project_root, ".env"))
         self.scenario = get_scenario(scenario_name)
+        if config_path:
+            self._apply_config_override(config_path)
         self.scenario.seed = seed
         self.out_dir = os.path.abspath(out_dir)
+        self.gui = gui
 
         self.ctrl_freq = 240
         self.dt = 1.0 / self.ctrl_freq
@@ -79,17 +86,56 @@ class ScenarioRunner:
         os.makedirs(self.logs_dir, exist_ok=True)
         self.logger = OperationalLogger(self.logs_dir)
         self.report_path = os.path.join(self.logs_dir, "report.json")
-        self.llm_enabled = llm
+        api_key = os.environ.get("OPENAI_API_KEY")
+        self.llm_enabled = bool(llm or api_key)
         self.llm_model = llm_model
+        if api_key:
+            masked = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 12 else "set"
+        else:
+            masked = "missing"
+        print(f"[LLM] enabled={self.llm_enabled}, key={masked}, model={self.llm_model}, flag={llm}")
 
         self.ring_buffer = deque(maxlen=int(5.0 / self.dt))
         self.no_feasible_steps = 0
         self.last_event = None
+        self.llm_triggered = False
+    def _apply_config_override(self, config_path: str):
+        """Override S1 config from a JSON file."""
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        # Enforce no reverse for S1
+        self.scenario.v_min = float(cfg.get("v_min", 0.0))
+
+        # Override initial speed (x)
+        init_speed = cfg.get("initial_speed")
+        if init_speed is not None:
+            self.scenario.initial_velocity[0] = float(init_speed)
+
+        # Override obstacle x (first obstacle)
+        obstacle_x = cfg.get("obstacle_x")
+        if obstacle_x is not None and self.scenario.obstacles:
+            self.scenario.obstacles[0][0] = float(obstacle_x)
+
+        # Override constraint limits
+        max_accel = cfg.get("max_acceleration")
+        if max_accel is not None:
+            self.scenario.constraint_config.max_acceleration = float(max_accel)
+        max_yaw = cfg.get("max_yaw_rate")
+        if max_yaw is not None:
+            self.scenario.constraint_config.max_yaw_rate = float(max_yaw)
+
+        # Optional overrides
+        if "max_steps" in cfg:
+            self.scenario.max_steps = int(cfg["max_steps"])
+        if "candidate_count" in cfg:
+            self.scenario.candidate_count = int(cfg["candidate_count"])
+
 
     def _create_env(self):
         self.env = CtrlAviary(
             num_drones=1,
-            gui=True,
+            gui=self.gui,
             physics=Physics.PYB,
             pyb_freq=self.ctrl_freq,
             ctrl_freq=self.ctrl_freq,
@@ -118,18 +164,34 @@ class ScenarioRunner:
     def _spawn_obstacles(self):
         self.obstacle_ids = []
         for pos in self.scenario.obstacles:
-            radius = 0.15
-            visual_id = p.createVisualShape(
-                p.GEOM_SPHERE,
-                radius=radius,
-                rgbaColor=[1, 0, 0, 0.9],
-                physicsClientId=self.env.CLIENT
-            )
-            collision_id = p.createCollisionShape(
-                p.GEOM_SPHERE,
-                radius=radius,
-                physicsClientId=self.env.CLIENT
-            )
+            shape = getattr(self.scenario, "obstacle_shape", "sphere")
+            size = getattr(self.scenario, "obstacle_size", {"radius": 0.15})
+            if shape in ("box", "wall"):
+                half_extents = size.get("half_extents", [0.1, 0.1, 0.1])
+                visual_id = p.createVisualShape(
+                    p.GEOM_BOX,
+                    halfExtents=half_extents,
+                    rgbaColor=[1, 0, 0, 0.9],
+                    physicsClientId=self.env.CLIENT
+                )
+                collision_id = p.createCollisionShape(
+                    p.GEOM_BOX,
+                    halfExtents=half_extents,
+                    physicsClientId=self.env.CLIENT
+                )
+            else:
+                radius = size.get("radius", 0.15)
+                visual_id = p.createVisualShape(
+                    p.GEOM_SPHERE,
+                    radius=radius,
+                    rgbaColor=[1, 0, 0, 0.9],
+                    physicsClientId=self.env.CLIENT
+                )
+                collision_id = p.createCollisionShape(
+                    p.GEOM_SPHERE,
+                    radius=radius,
+                    physicsClientId=self.env.CLIENT
+                )
             body_id = p.createMultiBody(
                 baseMass=0,
                 baseCollisionShapeIndex=collision_id,
@@ -151,7 +213,8 @@ class ScenarioRunner:
             if dist < 1e-6:
                 min_ttc = 0.0
                 continue
-            closing_speed = -np.dot(rel, velocity) / dist
+            # Closing speed should be positive when moving toward obstacle
+            closing_speed = np.dot(rel, velocity) / dist
             if closing_speed > 1e-6:
                 ttc = max(
                     0.0,
@@ -436,8 +499,24 @@ class ScenarioRunner:
                     last_tick=self.ring_buffer[-1] if self.ring_buffer else None,
                     language="ko",
                 )
-                print("\n[NLG Trigger Summary]")
-                print(event_entry["summary_text"])
+                if not self.llm_enabled:
+                    print("\n[NLG Trigger Summary]")
+                    print(event_entry["summary_text"])
+                # Optional LLM summary at trigger (only once)
+                if self.llm_enabled and not self.llm_triggered:
+                    llm_prompt = build_llm_prompt(
+                        report_stub,
+                        event_entry,
+                        self.ring_buffer[-1] if self.ring_buffer else None,
+                    )
+                    llm_text = call_openai_llm(llm_prompt, model=self.llm_model)
+                    event_entry["llm_summary_text"] = llm_text
+                    print("\n[LLM Trigger Summary]")
+                    print(llm_text)
+                    self.llm_triggered = True
+                elif not self.llm_enabled:
+                    print("\n[LLM Trigger Summary]")
+                    print("[LLM] disabled (KEY missing or --llm not set).")
                 self.logger.log_event(event_entry)
                 self.last_event = event_entry
 
@@ -479,8 +558,9 @@ class ScenarioRunner:
         with open(self.report_path, "w", encoding="utf-8") as f:
             import json
             json.dump(report, f, ensure_ascii=False, indent=2)
-        print("\n[NLG Final Summary]")
-        print(report["summary_text"])
+        if not self.llm_enabled:
+            print("\n[NLG Final Summary]")
+            print(report["summary_text"])
 
         # Optional LLM summary
         if self.llm_enabled:
@@ -506,7 +586,16 @@ def main():
     parser.add_argument("--frame-height", type=int, default=360)
     parser.add_argument("--llm", action="store_true", default=False, help="Enable LLM summary (OpenAI)")
     parser.add_argument("--llm-model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--config", type=str, default=None, help="Override scenario config JSON")
+    parser.add_argument("--gui", action="store_true", default=False, help="Force GUI on")
+    parser.add_argument("--headless", action="store_true", default=False, help="Force headless")
     args = parser.parse_args()
+
+    gui_enabled = True
+    if args.headless:
+        gui_enabled = False
+    elif args.gui:
+        gui_enabled = True
 
     runner = ScenarioRunner(
         args.scenario,
@@ -517,6 +606,8 @@ def main():
         frame_height=args.frame_height,
         llm=args.llm,
         llm_model=args.llm_model,
+        gui=gui_enabled,
+        config_path=args.config,
     )
     runner.run()
 

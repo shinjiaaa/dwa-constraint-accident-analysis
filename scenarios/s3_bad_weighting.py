@@ -24,6 +24,8 @@ class ScenarioConfig:
     initial_velocity: np.ndarray
     goal: np.ndarray
     obstacles: list
+    obstacle_shape: str
+    obstacle_size: dict
     constraint_config: ConstraintConfig
     cost_weights: dict
 
@@ -53,6 +55,8 @@ def build_s3() -> ScenarioConfig:
         obstacles=[
             np.array([2.5, 0.25, 1.0]),
         ],
+        obstacle_shape="sphere",
+        obstacle_size={"radius": 0.15},
         constraint_config=ConstraintConfig(
             min_obstacle_distance=0.5,
             max_acceleration=4.0,
