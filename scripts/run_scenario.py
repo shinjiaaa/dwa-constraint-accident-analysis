@@ -21,6 +21,8 @@ from src.constraints import ConstraintAuditor
 from src.explainer import DecisionExplainer
 from src.operational_logging import OperationalLogger
 from src.nlg import build_natural_language_summary
+from src.llm import build_llm_prompt, call_openai_llm
+from src.env import load_dotenv
 from scenarios import get_scenario
 
 try:
@@ -38,7 +40,10 @@ class ScenarioRunner:
         frame_interval_s: float = 1.0,
         frame_width: int = 640,
         frame_height: int = 360,
+        llm: bool = False,
+        llm_model: str = "gpt-4o-mini",
     ):
+        load_dotenv()
         self.scenario = get_scenario(scenario_name)
         self.scenario.seed = seed
         self.out_dir = os.path.abspath(out_dir)
@@ -74,6 +79,8 @@ class ScenarioRunner:
         os.makedirs(self.logs_dir, exist_ok=True)
         self.logger = OperationalLogger(self.logs_dir)
         self.report_path = os.path.join(self.logs_dir, "report.json")
+        self.llm_enabled = llm
+        self.llm_model = llm_model
 
         self.ring_buffer = deque(maxlen=int(5.0 / self.dt))
         self.no_feasible_steps = 0
@@ -174,8 +181,8 @@ class ScenarioRunner:
                 rot = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
                 forward = rot @ np.array([1.0, 0.0, 0.0])
                 up = rot @ np.array([0.0, 0.0, 1.0])
-                eye = np.array(pos) + 0.02 * up
-                target_pos = eye + 1.0 * forward
+                eye = np.array(pos) + 0.01 * up
+                target_pos = eye + 0.6 * forward
                 view = p.computeViewMatrix(
                     cameraEyePosition=eye.tolist(),
                     cameraTargetPosition=target_pos.tolist(),
@@ -184,24 +191,24 @@ class ScenarioRunner:
             else:
                 view = p.computeViewMatrixFromYawPitchRoll(
                     cameraTargetPosition=target.tolist(),
-                    distance=0.8,
+                    distance=0.5,
                     yaw=0,
                     pitch=-10,
                     roll=0,
                     upAxisIndex=2
                 )
         else:
-            # Closer third-person view
+            # Third-person: frame both drone and obstacle in view
             view = p.computeViewMatrixFromYawPitchRoll(
                 cameraTargetPosition=target.tolist(),
-                distance=1.6,
-                yaw=35,
-                pitch=-20,
+                distance=1.4,
+                yaw=30,
+                pitch=-18,
                 roll=0,
                 upAxisIndex=2
             )
         proj = p.computeProjectionMatrixFOV(
-            fov=60,
+            fov=45,
             aspect=width / height,
             nearVal=0.1,
             farVal=50.0
@@ -300,6 +307,12 @@ class ScenarioRunner:
             rpm = np.clip(rpm, 0, float(self.env.MAX_RPM))
         return rpm
 
+    def _third_person_target(self, drone_pos: np.ndarray) -> np.ndarray:
+        if self.scenario.obstacles:
+            nearest = min(self.scenario.obstacles, key=lambda o: np.linalg.norm(o - drone_pos))
+            return (drone_pos + nearest) / 2.0
+        return drone_pos
+
     def run(self):
         state = self._create_env()
         start_time = time.time()
@@ -359,9 +372,10 @@ class ScenarioRunner:
             self.logger.log_tick(tick_entry)
             self.ring_buffer.append(tick_entry)
 
-            # Screenshots every 0.5s
+            # Screenshots every interval
             if step % self.screenshot_interval_steps == 0:
-                self._save_frame(step, "periodic", position, mode="close")
+                third_target = self._third_person_target(position)
+                self._save_frame(step, "periodic", third_target, mode="close")
 
             # Trigger logic
             collision = self._check_collision()
@@ -385,8 +399,9 @@ class ScenarioRunner:
             )
 
             if trigger_s1 or trigger_s3:
+                third_target = self._third_person_target(position)
                 trigger_paths = [
-                    self._save_frame(step, "trigger", position, mode="close"),
+                    self._save_frame(step, "trigger", third_target, mode="close"),
                     self._save_frame(step, "trigger", position, mode="drone"),
                 ]
                 event_entry = {
@@ -421,6 +436,8 @@ class ScenarioRunner:
                     last_tick=self.ring_buffer[-1] if self.ring_buffer else None,
                     language="ko",
                 )
+                print("\n[NLG Trigger Summary]")
+                print(event_entry["summary_text"])
                 self.logger.log_event(event_entry)
                 self.last_event = event_entry
 
@@ -462,6 +479,19 @@ class ScenarioRunner:
         with open(self.report_path, "w", encoding="utf-8") as f:
             import json
             json.dump(report, f, ensure_ascii=False, indent=2)
+        print("\n[NLG Final Summary]")
+        print(report["summary_text"])
+
+        # Optional LLM summary
+        if self.llm_enabled:
+            prompt = build_llm_prompt(report, self.last_event, self.ring_buffer[-1] if self.ring_buffer else None)
+            llm_text = call_openai_llm(prompt, model=self.llm_model)
+            report["llm_summary_text"] = llm_text
+            with open(self.report_path, "w", encoding="utf-8") as f:
+                import json
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            print("\n[LLM Summary]")
+            print(llm_text)
 
 
 def main():
@@ -474,6 +504,8 @@ def main():
     parser.add_argument("--frame-interval", type=float, default=1.0)
     parser.add_argument("--frame-width", type=int, default=640)
     parser.add_argument("--frame-height", type=int, default=360)
+    parser.add_argument("--llm", action="store_true", default=False, help="Enable LLM summary (OpenAI)")
+    parser.add_argument("--llm-model", type=str, default="gpt-4o-mini")
     args = parser.parse_args()
 
     runner = ScenarioRunner(
@@ -483,6 +515,8 @@ def main():
         frame_interval_s=args.frame_interval,
         frame_width=args.frame_width,
         frame_height=args.frame_height,
+        llm=args.llm,
+        llm_model=args.llm_model,
     )
     runner.run()
 

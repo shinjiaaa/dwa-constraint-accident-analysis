@@ -2,6 +2,8 @@
 /__pycache__
 /logs/
 /outputs/
+/.env
 /venv/
 /venvs/
 *.pyc
+.env
