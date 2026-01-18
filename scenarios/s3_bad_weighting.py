@@ -35,40 +35,40 @@ def build_s3() -> ScenarioConfig:
         name="s3",
         gt_label="BAD_DECISION_WEIGHTING",
         expected_xai=(
-            "Top-K contains safer feasible candidate; chosen candidate wins by goal term; "
-            "near-miss occurs with N_feasible > 0."
+            "N_feasible stays > 0 at trigger; Top-K includes a safer feasible detour; "
+            "the chosen action wins mainly by the goal_distance term, leading to near-miss/collision."
         ),
         description=(
-            "Safe detour exists but weights make goal alignment dominate obstacle avoidance, "
-            "causing risky choice while feasible alternatives exist."
+            "A safe detour exists, but cost weights over-emphasize goal progress so the planner "
+            "selects a risky near-straight trajectory despite feasible safer alternatives."
         ),
         seed=0,
         max_steps=300,
         candidate_count=200,
-        v_min=-2.0,
+        v_min=0.0,
         v_max=2.0,
         yaw_rate_min=-1.0,
         yaw_rate_max=1.0,
         initial_position=np.array([0.0, 0.0, 1.0]),
-        initial_velocity=np.array([0.8, 0.0, 0.0]),
+        initial_velocity=np.array([1.2, 0.0, 0.0]),
         goal=np.array([5.0, 0.0, 1.0]),
         obstacles=[
-            np.array([2.5, 0.25, 1.0]),
+            np.array([2.2, 0.05, 1.0]),
         ],
         obstacle_shape="sphere",
-        obstacle_size={"radius": 0.15},
+        obstacle_size={"radius": 0.35},
         constraint_config=ConstraintConfig(
-            min_obstacle_distance=0.5,
-            max_acceleration=4.0,
-            max_yaw_rate=1.5,
+            min_obstacle_distance=0.6,
+            max_acceleration=1.8,
+            max_yaw_rate=0.9,
             max_velocity=2.5,
             min_altitude=0.8,
             max_altitude=1.5,
         ),
         cost_weights={
-            "goal_distance": 12.0,
-            "obstacle": 0.8,
+            "goal_distance": 10.0,
+            "obstacle": 1.0,
             "velocity": 0.1,
-            "yaw_rate": 0.5,
+            "yaw_rate": 0.4,
         },
     )

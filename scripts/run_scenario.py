@@ -2,6 +2,7 @@
 Run S1 or S3 with GUI + screenshots + operational logging.
 """
 
+import csv
 import json
 import os
 import sys
@@ -54,6 +55,7 @@ class ScenarioRunner:
         self.scenario.seed = seed
         self.out_dir = os.path.abspath(out_dir)
         self.gui = gui
+        self.run_id = f"{self.scenario.name}_seed{seed}_{time.strftime('%Y%m%d_%H%M%S')}"
 
         self.ctrl_freq = 240
         self.dt = 1.0 / self.ctrl_freq
@@ -80,12 +82,16 @@ class ScenarioRunner:
         self.obstacle_ids = []
 
         # Output structure
-        self.frames_dir = os.path.join(self.out_dir, self.scenario.name, "frames")
-        self.logs_dir = os.path.join(self.out_dir, self.scenario.name)
+        self.run_dir = os.path.join(
+            self.out_dir, self.scenario.name, f"seed_{seed}", f"run_{self.run_id}"
+        )
+        self.frames_dir = os.path.join(self.run_dir, "frames")
+        self.logs_dir = self.run_dir
         os.makedirs(self.frames_dir, exist_ok=True)
         os.makedirs(self.logs_dir, exist_ok=True)
         self.logger = OperationalLogger(self.logs_dir)
         self.report_path = os.path.join(self.logs_dir, "report.json")
+        self.run_summary_path = os.path.join(self.out_dir, "run_summary.csv")
         api_key = os.environ.get("OPENAI_API_KEY")
         self.llm_enabled = bool(llm or api_key)
         self.llm_model = llm_model
@@ -99,6 +105,12 @@ class ScenarioRunner:
         self.no_feasible_steps = 0
         self.last_event = None
         self.llm_triggered = False
+        self.first_zero_step = None
+        self.current_zero_streak = 0
+        self.max_zero_streak = 0
+        self.dominant_constraint_counts = {}
+        self.near_miss = False
+        self.collided = False
     def _apply_config_override(self, config_path: str):
         """Override S1 config from a JSON file."""
         with open(config_path, "r", encoding="utf-8") as f:
@@ -336,20 +348,39 @@ class ScenarioRunner:
 
         return terms, total
 
-    def _build_top_k(self, candidates, cost_expl, feasibility, k=5):
+    def _build_top_k(self, candidates, cost_expl, feasibility, current_state, k=5):
         id_to_cand = {c["id"]: c for c in candidates}
         id_to_audit = {r.candidate_id: r for r in feasibility.candidate_results}
         top = []
         for cand_id, cost in cost_expl["scores"][:k]:
             audit = id_to_audit[cand_id]
+            terms, _ = self._build_cost_terms(id_to_cand[cand_id], current_state, self.scenario.cost_weights)
             top.append({
                 "candidate_id": cand_id,
                 "action": id_to_cand[cand_id]["action"].tolist(),
                 "cost_total": cost,
                 "is_feasible": audit.is_feasible,
                 "slack_vector": {v.constraint_name: -float(v.violation_amount) for v in audit.violations},
+                "cost_terms": terms,
             })
         return top
+
+    def _find_safer_alternative(self, top_k: List[Dict]) -> Tuple[Optional[Dict], Optional[int]]:
+        """Pick a safer feasible alternative (max min_obstacle_distance slack)."""
+        best = None
+        best_rank = None
+        best_slack = -float("inf")
+        for idx, cand in enumerate(top_k, start=1):
+            if not cand.get("is_feasible"):
+                continue
+            slack = cand.get("slack_vector", {}).get("min_obstacle_distance", None)
+            if slack is None:
+                slack = 0.0
+            if slack > best_slack:
+                best_slack = slack
+                best = cand
+                best_rank = idx
+        return best, best_rank
 
     def _velocity_to_rpm(self, velocity_cmd: np.ndarray, yaw_rate: float) -> np.ndarray:
         base_rpm = float(self.env.HOVER_RPM) if hasattr(self.env, "HOVER_RPM") else 400.0
@@ -394,17 +425,27 @@ class ScenarioRunner:
             position = state[:3]
             velocity = state[3:6]
             dist_min, ttc = self._compute_dist_min_ttc(position, velocity)
+            if dist_min < 0.5:
+                self.near_miss = True
             selected_audit = next(
                 r for r in feasibility.candidate_results if r.candidate_id == best["id"]
             )
             selected_slack = {v.constraint_name: -float(v.violation_amount) for v in selected_audit.violations}
             cost_terms, cost_total = self._build_cost_terms(best, state, self.scenario.cost_weights)
+            dominant_constraint = None
+            if feasibility.per_constraint_stats:
+                dominant_constraint = max(
+                    feasibility.per_constraint_stats.items(),
+                    key=lambda x: x[1].get("violation_ratio", 0.0)
+                )[0]
 
             # Logging (tick)
             tick_entry = {
+                "run_id": self.run_id,
                 "time_s": time.time() - start_time,
                 "timestep": step,
                 "scenario": self.scenario.name,
+                "seed": self.scenario.seed,
                 "gt_label": self.scenario.gt_label,
                 "state": {
                     "position": position.tolist(),
@@ -413,11 +454,12 @@ class ScenarioRunner:
                 },
                 "selected_action": best["action"].tolist(),
                 "metrics": {
-                    "dist_min": dist_min,
-                    "ttc": ttc,
-                    "candidate_count": len(candidates),
+                    "min_obstacle_distance": dist_min,
+                    "min_time_to_collision": ttc,
+                    "n_candidates": len(candidates),
                     "n_feasible": feasibility.n_feasible,
                     "feasible_ratio": feasibility.feasible_ratio,
+                    "dominant_constraint": dominant_constraint,
                     "decision_margin": cost_expl.get("top_2_margin"),
                 },
                 "dwa": {
@@ -442,10 +484,21 @@ class ScenarioRunner:
 
             # Trigger logic
             collision = self._check_collision()
+            if collision:
+                self.collided = True
             if feasibility.n_feasible == 0:
                 self.no_feasible_steps += 1
+                if self.first_zero_step is None:
+                    self.first_zero_step = step
+                self.current_zero_streak += 1
+                self.max_zero_streak = max(self.max_zero_streak, self.current_zero_streak)
+                if dominant_constraint:
+                    self.dominant_constraint_counts[dominant_constraint] = (
+                        self.dominant_constraint_counts.get(dominant_constraint, 0) + 1
+                    )
             else:
                 self.no_feasible_steps = 0
+                self.current_zero_streak = 0
 
             trigger_s1 = (
                 self.scenario.name == "s1"
@@ -463,29 +516,59 @@ class ScenarioRunner:
 
             if trigger_s1 or trigger_s3:
                 third_target = self._third_person_target(position)
-                trigger_paths = [
-                    self._save_frame(step, "trigger", third_target, mode="close"),
-                    self._save_frame(step, "trigger", position, mode="drone"),
-                ]
+                trigger_paths = []
+                if self.scenario.name in ("s1", "s3") and self.gui:
+                    trigger_paths = [
+                        self._save_frame(step, "trigger", third_target, mode="close"),
+                        self._save_frame(step, "trigger", position, mode="drone"),
+                    ]
+                top_k = self._build_top_k(candidates, cost_expl, feasibility, state, k=5)
+                safer_alt, safer_rank = self._find_safer_alternative(top_k)
+                decision_margin = None
+                if safer_alt is not None:
+                    decision_margin = float(safer_alt["cost_total"] - cost_total)
                 event_entry = {
+                    "run_id": self.run_id,
                     "time_s": time.time() - start_time,
                     "timestep": step,
                     "scenario": self.scenario.name,
+                    "seed": self.scenario.seed,
                     "gt_label": self.scenario.gt_label,
                     "reason": "trigger",
                     "ring_buffer": list(self.ring_buffer),
-                    "top_k": self._build_top_k(candidates, cost_expl, feasibility, k=5),
-                    "constraints": {
+                    "top_k": top_k,
+                    "feasible_set_statistics": {
+                        "n_candidates": len(candidates),
+                        "n_feasible": feasibility.n_feasible,
+                        "feasible_ratio": feasibility.feasible_ratio,
+                    },
+                    "constraint_violation_summary": {
+                        "dominant_constraint": dominant_constraint,
                         "per_constraint_stats": feasibility.per_constraint_stats,
-                        "minimal_relaxation": feasibility.minimal_relaxation,
+                    },
+                    "minimal_relaxation": {
+                        "delta_accel": None,
+                        "delta_yaw": None,
                     },
                     "metrics": {
-                        "dist_min": dist_min,
-                        "ttc": ttc,
+                        "min_obstacle_distance": dist_min,
+                        "min_time_to_collision": ttc,
                         "n_feasible": feasibility.n_feasible,
+                    },
+                    "selected_vs_safer_alternative": {
+                        "safer_feasible_alternative_exists": safer_alt is not None,
+                        "safer_alternative_rank": safer_rank,
+                        "decision_margin": decision_margin,
+                        "selected_action": best["action"].tolist(),
+                        "selected_cost_total": cost_total,
+                        "safer_action": safer_alt["action"] if safer_alt else None,
+                        "safer_cost_total": safer_alt["cost_total"] if safer_alt else None,
                     },
                     "screenshots": trigger_paths,
                 }
+                if feasibility.minimal_relaxation:
+                    event_entry["minimal_relaxation"]["delta_accel"] = feasibility.minimal_relaxation.get("max_acceleration")
+                    event_entry["minimal_relaxation"]["delta_yaw"] = feasibility.minimal_relaxation.get("max_yaw_rate")
                 # Build natural language summary at trigger
                 report_stub = {
                     "scenario": self.scenario.name,
