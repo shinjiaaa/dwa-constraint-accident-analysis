@@ -80,6 +80,7 @@ class ScenarioRunner:
 
         self.env = None
         self.obstacle_ids = []
+        self.obstacle_initial_positions = []  # Store initial positions for moving obstacles
 
         # Output structure
         self.run_dir = os.path.join(
@@ -175,7 +176,9 @@ class ScenarioRunner:
 
     def _spawn_obstacles(self):
         self.obstacle_ids = []
+        self.obstacle_initial_positions = []
         for pos in self.scenario.obstacles:
+            self.obstacle_initial_positions.append(pos.copy())
             shape = getattr(self.scenario, "obstacle_shape", "sphere")
             size = getattr(self.scenario, "obstacle_size", {"radius": 0.15})
             if shape in ("box", "wall"):
@@ -407,11 +410,57 @@ class ScenarioRunner:
             return (drone_pos + nearest) / 2.0
         return drone_pos
 
+    def _update_moving_obstacles(self, step: int, drone_position: np.ndarray, drone_velocity: np.ndarray):
+        """Update moving obstacles (for S3: move toward drone's straight path)."""
+        if self.scenario.name != "s3" or not self.obstacle_ids:
+            return
+        
+        # For S3: move obstacle toward the straight path to goal
+        if len(self.obstacle_ids) > 0 and len(self.scenario.obstacles) > 0:
+            obstacle_id = self.obstacle_ids[0]
+            current_obs_pos = np.array(self.scenario.obstacles[0])
+            
+            # Calculate straight path from drone to goal
+            goal = self.scenario.goal
+            straight_path_y = goal[1]  # Goal's y position (should be 0 for straight path)
+            
+            # Move obstacle toward the straight path (y=0 line) at x position where drone will be
+            # Predict drone position in ~1 second
+            predicted_drone_x = drone_position[0] + drone_velocity[0] * 1.0
+            
+            # Target: intercept the straight path MORE AGGRESSIVELY
+            # Move directly to where drone will be (closer prediction)
+            target_x = drone_position[0] + drone_velocity[0] * 0.8  # Closer prediction
+            target_y = 0.0  # Straight path (y=0)
+            target_z = current_obs_pos[2]
+            
+            # Move obstacle toward target (FASTER movement)
+            speed = 1.2  # m/s (much faster - was 0.3)
+            direction = np.array([target_x, target_y, target_z]) - current_obs_pos
+            dist = np.linalg.norm(direction)
+            if dist > 0.01:
+                direction = direction / dist
+                new_pos = current_obs_pos + direction * speed * self.dt
+                # Update obstacle position
+                p.resetBasePositionAndOrientation(
+                    obstacle_id,
+                    new_pos.tolist(),
+                    [0, 0, 0, 1],
+                    physicsClientId=self.env.CLIENT
+                )
+                # Update scenario obstacles list for distance calculation
+                self.scenario.obstacles[0] = new_pos
+
     def run(self):
         state = self._create_env()
         start_time = time.time()
 
         for step in range(self.scenario.max_steps):
+            # Update moving obstacles (for S3)
+            position = state[:3]
+            velocity = state[3:6]
+            self._update_moving_obstacles(step, position, velocity)
+            
             # Generate candidates & audit
             candidates = self.dwa.generate_candidates(state, num_candidates=self.scenario.candidate_count)
             feasibility = self.auditor.audit_feasible_set(
@@ -421,9 +470,7 @@ class ScenarioRunner:
                 candidates, state, self.scenario.goal, self.scenario.obstacles, self.scenario.cost_weights
             )
 
-            # Metrics
-            position = state[:3]
-            velocity = state[3:6]
+            # Metrics (position and velocity already extracted above)
             dist_min, ttc = self._compute_dist_min_ttc(position, velocity)
             if dist_min < 0.5:
                 self.near_miss = True
@@ -510,9 +557,18 @@ class ScenarioRunner:
             )
             trigger_s3 = (
                 self.scenario.name == "s3"
-                and (dist_min < 0.5)
-                and (feasibility.n_feasible > 0)
+                and (
+                    collision  # Trigger on collision
+                    or (
+                        dist_min < 0.5  # Close distance
+                        and feasibility.n_feasible > 0  # MUST have feasible alternatives (S3's core requirement)
+                    )
+                )
             )
+
+            # Debug: print trigger condition status for S3 (every 20 steps for more frequent updates)
+            if self.scenario.name == "s3" and step % 20 == 0:
+                print(f"[S3 Debug] step={step}, dist_min={dist_min:.3f}, n_feasible={feasibility.n_feasible}, collided={collision}, trigger={trigger_s3}")
 
             if trigger_s1 or trigger_s3:
                 third_target = self._third_person_target(position)
@@ -587,16 +643,34 @@ class ScenarioRunner:
                     print(event_entry["summary_text"])
                 # Optional LLM summary at trigger (only once)
                 if self.llm_enabled and not self.llm_triggered:
-                    llm_prompt = build_llm_prompt(
-                        report_stub,
-                        event_entry,
-                        self.ring_buffer[-1] if self.ring_buffer else None,
-                    )
-                    llm_text = call_openai_llm(llm_prompt, model=self.llm_model)
-                    event_entry["llm_summary_text"] = llm_text
-                    print("\n[LLM Trigger Summary]")
-                    print(llm_text)
-                    self.llm_triggered = True
+                    try:
+                        print(f"\n[LLM] Calling OpenAI API (model={self.llm_model})...")
+                        print(f"[LLM] Event data: dist_min={dist_min:.3f}, n_feasible={feasibility.n_feasible}, collided={collision}")
+                        llm_prompt = build_llm_prompt(
+                            report_stub,
+                            event_entry,
+                            self.ring_buffer[-1] if self.ring_buffer else None,
+                        )
+                        llm_text = call_openai_llm(llm_prompt, model=self.llm_model)
+                        if llm_text and not llm_text.startswith("[LLM] Error"):
+                            event_entry["llm_summary_text"] = llm_text
+                            print("\n" + "="*60)
+                            print("[LLM Trigger Summary]")
+                            print("="*60)
+                            print(llm_text)
+                            print("="*60)
+                        else:
+                            print(f"\n[LLM] Failed: {llm_text}")
+                            event_entry["llm_summary_text"] = llm_text
+                        self.llm_triggered = True
+                    except Exception as e:
+                        print(f"\n[LLM] Exception during LLM call: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        event_entry["llm_summary_text"] = f"[LLM] Exception: {e}"
+                        self.llm_triggered = True
+                elif not self.llm_enabled:
+                    print("\n[LLM] Skipped (not enabled)")
                 elif not self.llm_enabled:
                     print("\n[LLM Trigger Summary]")
                     print("[LLM] disabled (KEY missing or --llm not set).")
