@@ -1,0 +1,33 @@
+{
+  "scenario": "s2",
+  "gt_label": "BAD_DECISION",
+  "predicted_label": "BAD_DECISION",
+  "expected_xai": "At trigger, N_feasible > 0 and Top-K contains a safer feasible detour. However, the selected action wins due to the goal term dominance, leading to collision/near-miss.",
+  "summary_text": "[시나리오 s2] GT=BAD_DECISION, 예측=BAD_DECISION\n기대 XAI: At trigger, N_feasible > 0 and Top-K contains a safer feasible detour. However, the selected action wins due to the goal term dominance, leading to collision/near-miss.\nDWA 선택 근거: cost=230.738, margin=0.028, goal=5.767, obs_pen=0.000, vel=2.244, yaw=1.685\n비용 항 우세도: goal_term(201.845) >> obstacle_term(0.000) → 목표 지향성 비용 항 우세 (goal term dominance)\n제약 기반 판단: n_feasible=1, dist_min=N/A, TTC=N/A, dominant=None\nRQ3 결정 마진: 선택된 행동(cost=230.738) vs 더 안전한 feasible 대안(cost=239.404) = 8.666 (Top-K 내 순위: 10)\n→ 위험한 행동이 더 낮은 비용(230.738)으로 선택되어 안전한 대안(239.404)보다 8.666만큼 우선됨\n대안: feasible 후보 존재 (id=20, cost=239.404).",
+  "rq3_coverage": {
+    "비용 항 분해": {
+      "goal_distance": 5.767,
+      "obstacle_penalty": 0.000,
+      "velocity_magnitude": 2.244,
+      "yaw_rate_magnitude": 1.685
+    },
+    "결정 마진 (선택된 행동 vs 더 안전한 대안)": {
+      "선택된 행동 비용": 230.738,
+      "더 안전한 대안 비용": 239.404,
+      "비용 차이": 8.666,
+      "더 안전한 대안 Top-K 내 순위": 10
+    },
+    "비용 항 우세도 분석": {
+      "goal_term (가중치 적용)": 201.845,
+      "obstacle_term (가중치 적용)": 0.000,
+      "결론": "목표 지향성 비용 항 우세 (goal term dominance)",
+      "설명": "goal_term이 obstacle_term보다 압도적으로 높아, 목표 지향성 비용이 장애물 회피 비용보다 우선하여 위험한 직진 경로가 선택됨"
+    },
+    "RQ3 충족 여부": {
+      "비용 항 분해": "✅ 충족",
+      "결정 마진": "✅ 충족",
+      "비용 항 우세도 분석": "✅ 충족",
+      "전체 충족": "✅ 완전 충족"
+    }
+  }
+}

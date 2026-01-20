@@ -1,84 +1,88 @@
 # 검증 체크리스트 (Validation Checklist)
 
-이 문서는 사고 사후 분석 시스템의 정확성을 검증하기 위한 체크리스트입니다.
+이 문서는 Replay Contract 기반 사후 판별 시스템의 정확성을 검증하기 위한 체크리스트입니다.
 
-## 1. 제약 기반 XAI가 필연성을 올바르게 감지하는지 검증
+목적: 사고 원인 규명이 아니라 **조사 범위를 줄이는 트리아지** 수행 여부 검증
 
-### 1.1 Scenario A (Inevitable Collision) 검증
+## 1. 불가피성 판별 검증 (S1)
 
-**목표**: Feasible set이 비어있을 때 필연성 감지
+### 1.1 S1 (Inevitable Collision) 검증
+
+**목표**: Feasible set이 비어있을 때 불가피성(inevitability) 판별
 
 **검증 항목**:
 
 - [ ] `N_feasible == 0` 감지
   ```bash
-  # events.jsonl에서 'no_feasible_actions' 이벤트 확인
-  grep '"event_type": "no_feasible_actions"' logs/events_*.jsonl
+  # events.jsonl에서 트리거 이벤트 확인
+  jq '.metrics.n_feasible' outputs/s1/seed_0/run_*/events.jsonl
   ```
 
 - [ ] Minimal relaxation 계산
   ```bash
   # minimal_relaxation 필드가 있는지 확인
-  grep '"minimal_relaxation"' logs/events_*.jsonl
+  jq '.minimal_relaxation' outputs/s1/seed_0/run_*/events.jsonl
   ```
   
+- [ ] 지배 제약(dominant constraint) 확인
+  ```bash
+  # dominant_constraint 필드 확인
+  jq '.constraint_violation_summary.dominant_constraint' outputs/s1/seed_0/run_*/events.jsonl
+  ```
+
 - [ ] 각 제약별 violation_ratio 확인
-  - `min_obstacle_distance` violation_ratio ≈ 1.0 (모든 후보 위반)
-  - 다른 제약도 높은 violation_ratio
+  - 주로 `max_acceleration` 또는 `max_yaw_rate`가 지배 제약
+  - 해당 제약의 violation_ratio가 높음
 
 **기대 결과**:
-- 모든 timestep에서 `n_feasible = 0`
-- `minimal_relaxation`에 각 제약의 완화 필요량 기록
-- 예: `{"min_obstacle_distance": 0.3, "max_velocity": 0.5}`
+- 충돌 전 >= 0.3초 동안 `n_feasible == 0` 지속
+- `minimal_relaxation.delta_accel`이 의미 있게 큼 (> 10.0)
+- 지배 제약이 명확히 식별됨
 
-### 1.2 Scenario B (Wrong Decision) 검증
+## 2. 선택오류 판별 검증 (S2)
 
-**목표**: Feasible set이 비어있지 않지만 잘못된 결정
+### 2.1 S2 (Wrong Decision) 검증
+
+**목표**: Feasible set이 존재하지만 선택오류(choice error) 판별
 
 **검증 항목**:
 
 - [ ] `N_feasible > 0` 감지
   ```bash
-  # 대부분의 timestep에서 feasible candidates 존재
-  grep '"feasible_ratio"' logs/ticks_*.jsonl | head -20
+  # 트리거 시점에 feasible candidates 존재
+  jq '.metrics.n_feasible' outputs/s2/seed_0/run_*/events.jsonl
   ```
 
-- [ ] 선택된 액션이 제약 위반인지 확인
+- [ ] 더 안전한 feasible 대안 존재 확인
   ```bash
-  # constraint_violation 이벤트 확인
-  grep '"event_type": "constraint_violation"' logs/events_*.jsonl
+  # safer_feasible_alternative_exists 필드 확인
+  jq '.selected_vs_safer_alternative.safer_feasible_alternative_exists' outputs/s2/seed_0/run_*/events.jsonl
   ```
 
-- [ ] 대안(feasible alternatives) 제시 확인
-  - `explanation['best_feasible_alternatives']` 필드 존재
-  - 대안의 cost가 선택된 액션보다 높을 수 있음
+- [ ] Top-K 후보 비교 확인
+  ```bash
+  # Top-K에 feasible 후보가 포함되어 있는지 확인
+  jq '.top_k[] | select(.is_feasible == true)' outputs/s2/seed_0/run_*/events.jsonl
+  ```
+
+- [ ] 비용 항 분해 확인
+  ```bash
+  # 선택된 행동의 cost_terms 확인
+  jq '.top_k[0].cost_terms' outputs/s2/seed_0/run_*/events.jsonl
+  ```
+
+- [ ] 결정 마진 확인
+  ```bash
+  # decision_margin 확인 (작아야 함)
+  jq '.selected_vs_safer_alternative.decision_margin' outputs/s2/seed_0/run_*/events.jsonl
+  ```
 
 **기대 결과**:
-- 일부 timestep에서 `n_feasible > 0`이지만 선택된 액션이 infeasible
-- Decision explanation에 "wrong decision" 원인 명시
-- Cost breakdown에서 goal_distance가 과도하게 높은 가중치
-
-### 1.3 Scenario C (Delayed Response) 검증
-
-**목표**: 시간 지연 패턴 감지
-
-**검증 항목**:
-
-- [ ] Step 30 이전: feasible actions 존재
-- [ ] Step 30 이후: feasible actions 감소 또는 제약 위반 증가
-  ```bash
-  # Step 30 근처의 feasible_ratio 변화 확인
-  awk '/"timestep": 2[89]/,/"timestep": 32/' logs/ticks_*.jsonl | grep feasible_ratio
-  ```
-
-- [ ] Temporal pattern 분석
-  - 초기: 높은 velocity, feasible actions 존재
-  - 후기: 제약 위반 증가, 충돌 가능성 증가
-
-**기대 결과**:
-- Step 30 이전: `feasible_ratio` 상대적으로 높음
-- Step 30 이후: `feasible_ratio` 급격히 감소
-- `near_collision` 이벤트 발생
+- 트리거 시점에 `n_feasible > 0`
+- `safer_feasible_alternative_exists == true`
+- Top-K에 feasible 후보 존재
+- 선택된 행동의 `goal_distance` 항이 우세 (비용 구조 문제)
+- 결정 마진이 작음 (< 2.0)
 
 ## 2. 의사결정 수준 XAI가 선택을 올바르게 설명하는지 검증
 
@@ -94,9 +98,8 @@
   ```
 
 **기대 결과**:
-- Scenario A: "Selected action violates constraints. This indicates an inevitable collision..."
-- Scenario B: "Selected from very small feasible set..." 또는 "Selected based on lowest cost..."
-- Scenario C: 일반적인 선택 이유, 후반부에 필연성 언급
+- S1: Feasible set collapse로 인한 필연성 명시
+- S2: 비용 구조로 인한 선택오류 명시
 
 ### 2.2 Cost Ranking 검증
 
@@ -117,7 +120,7 @@
 **기대 결과**:
 - 모든 ranking이 cost 오름차순
 - Margin이 작을수록 ambiguous decision
-- Scenario B에서 feasible 후보가 ranking에 있지만 선택되지 않음
+- S2에서 feasible 후보가 ranking에 있지만 선택되지 않음
 
 ### 2.3 Score Breakdown 검증
 
@@ -131,8 +134,8 @@
   ```
 
 **기대 결과**:
-- Scenario B에서 `goal_distance`가 매우 높은 가중치
-- Scenario C에서 초기 `velocity_magnitude`가 높음
+- S2에서 `goal_distance`가 매우 높은 가중치 (선택오류의 원인)
+- S1에서 제약 위반으로 인한 필연성
 - Obstacle proximity가 가까울수록 높은 penalty
 
 ## 3. 로그가 사고 사후 분석에 충분한지 검증
@@ -207,10 +210,9 @@
   - State 변화 추적 가능
   - Constraint violation 패턴 추적 가능
 
-- [ ] 원인 분석 가능 여부
-  - Scenario A: Minimal relaxation로 필연성 증명
-  - Scenario B: Cost breakdown으로 잘못된 가중치 식별
-  - Scenario C: Temporal pattern으로 지연 감지
+- [ ] 판별 가능 여부
+  - S1: Minimal relaxation로 불가피성 판별
+  - S2: Cost breakdown 및 Top-K 비교로 선택오류 판별
 
 ## 4. 재현성 검증
 
@@ -221,9 +223,9 @@
 - [ ] 동일한 시드로 실행 시 동일한 결과
   ```bash
   # 두 번 실행하고 결과 비교
-  python scripts/run_scenario.py --scenario A > run1.log
-  python scripts/run_scenario.py --scenario A > run2.log
-  diff logs/ticks_*_run1.jsonl logs/ticks_*_run2.jsonl
+  python scripts/run_scenario.py --scenario s1 --seed 0 --out outputs/ > run1.log
+  python scripts/run_scenario.py --scenario s1 --seed 0 --out outputs/ > run2.log
+  diff outputs/s1/seed_0/run_*/ticks.jsonl
   ```
 
 **기대 결과**:
@@ -234,11 +236,11 @@
 
 **검증 항목**:
 
-- [ ] 각 시나리오가 명확한 ground truth cause를 가지고 있는지
+- [ ] 각 시나리오가 명확한 판별 목적을 가지고 있는지
 - [ ] 시나리오 설정이 문서화되어 있는지
   ```bash
   # 시나리오 설정 확인
-  python -c "from src.scenarios import ScenarioFactory; s = ScenarioFactory.get_scenario('A'); print(s.ground_truth_cause)"
+  python -c "from scenarios import get_scenario; s = get_scenario('s1'); print(s.gt_label)"
   ```
 
 ## 5. 자동화된 검증 스크립트
@@ -246,7 +248,7 @@
 검증을 자동화하는 스크립트를 실행:
 
 ```bash
-python scripts/validate_results.py --scenario A --log-dir logs/
+python scripts/validate_results.py --scenario s1 --outputs outputs/
 ```
 
 **검증 스크립트가 체크하는 항목**:
@@ -265,17 +267,17 @@ python scripts/validate_results.py --scenario A --log-dir logs/
 - 장애물 배치가 충돌을 필연적으로 만들지 않음
 
 **해결**:
-- `scenario_a_inevitable_collision()`의 `constraint_config` 조정
+- `scenarios/s1_inevitable_dynamics.py`의 `constraint_config` 조정
 - 장애물 위치 조정
 
-### 문제: Wrong decision이 감지되지 않음
+### 문제: 선택오류가 감지되지 않음
 
 **원인**:
 - Cost weights가 충분히 극단적이지 않음
 - Feasible path가 너무 명확함
 
 **해결**:
-- `scenario_b_wrong_decision()`의 `cost_weights` 조정
+- `scenarios/s2_bad_decision.py`의 `cost_weights` 조정
 - 장애물 위치를 경로에 더 가깝게
 
 ### 문제: 로그 파일이 생성되지 않음
@@ -286,8 +288,7 @@ python scripts/validate_results.py --scenario A --log-dir logs/
 
 **해결**:
 ```bash
-mkdir -p logs
-chmod 755 logs
+mkdir -p outputs
 # Python 오류 확인
-python scripts/run_scenario.py --scenario A 2>&1 | grep -i error
+python scripts/run_scenario.py --scenario s1 --seed 0 --out outputs/ 2>&1 | grep -i error
 ```

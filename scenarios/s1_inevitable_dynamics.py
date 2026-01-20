@@ -1,5 +1,11 @@
 """
 S1: Inevitable collision due to dynamics (Feasible set = empty).
+
+This scenario demonstrates the "inevitability" (불가피성) category:
+- Feasible set collapses to empty (N_feasible == 0) before collision
+- Constraint saturation prevents safe alternatives
+- Used to test the system's ability to identify inevitable accidents
+  through feasible set auditing and minimal relaxation analysis
 """
 
 from dataclasses import dataclass

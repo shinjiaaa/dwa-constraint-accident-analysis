@@ -1,5 +1,18 @@
 """
-Run S1 or S3 with GUI + screenshots + operational logging.
+Run S1 or S2 with GUI + screenshots + operational logging.
+
+Implements the Replay Contract for post-hoc decision forensics:
+- Continuous low-bit tick logging (ticks.jsonl): enables replay of decision context
+  (state, selected action, DWA cost terms, constraint statistics)
+- Event-triggered sketch logs (events.jsonl): ring buffer, Top-K candidates, 
+  minimal relaxation for triage (investigation scope reduction)
+
+The purpose is NOT to determine the root cause of accidents, but to TRIAGE:
+(i) Inevitability (불가피성): Did safe alternatives exist? → feasible set, dominant constraint, minimal relaxation
+(ii) Choice error (선택오류): Why was risky action chosen? → Top-K comparison, cost breakdown, decision margin
+
+S1: Tests inevitability - feasible set collapses to empty (feasible=∅)
+S2: Tests choice error - feasible set exists but risky action chosen due to cost structure (feasible≠∅)
 """
 
 import csv
@@ -20,11 +33,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.dwa import DWACandidateGenerator
 from src.constraints import ConstraintAuditor
-from src.explainer import DecisionExplainer
 from src.operational_logging import OperationalLogger
 from src.nlg import build_natural_language_summary
-from src.llm import build_llm_prompt, call_openai_llm
-from src.env import load_dotenv
 from scenarios import get_scenario
 
 try:
@@ -42,13 +52,9 @@ class ScenarioRunner:
         frame_interval_s: float = 1.0,
         frame_width: int = 640,
         frame_height: int = 360,
-        llm: bool = False,
-        llm_model: str = "gpt-4o-mini",
         gui: bool = True,
         config_path: Optional[str] = None,
     ):
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        load_dotenv(os.path.join(project_root, ".env"))
         self.scenario = get_scenario(scenario_name)
         if config_path:
             self._apply_config_override(config_path)
@@ -66,17 +72,19 @@ class ScenarioRunner:
 
         np.random.seed(seed)
 
+        # For S2, use higher resolution to ensure safer alternatives are sampled
+        v_res = 7 if self.scenario.name == "s2" else 5
+        yaw_res = 7 if self.scenario.name == "s2" else 5
         self.dwa = DWACandidateGenerator(
             v_min=self.scenario.v_min,
             v_max=self.scenario.v_max,
             yaw_rate_min=self.scenario.yaw_rate_min,
             yaw_rate_max=self.scenario.yaw_rate_max,
-            v_resolution=5,
-            yaw_rate_resolution=5,
+            v_resolution=v_res,
+            yaw_rate_resolution=yaw_res,
             seed=seed,
         )
         self.auditor = ConstraintAuditor(config=self.scenario.constraint_config)
-        self.explainer = DecisionExplainer(self.dwa, self.auditor)
 
         self.env = None
         self.obstacle_ids = []
@@ -93,25 +101,23 @@ class ScenarioRunner:
         self.logger = OperationalLogger(self.logs_dir)
         self.report_path = os.path.join(self.logs_dir, "report.json")
         self.run_summary_path = os.path.join(self.out_dir, "run_summary.csv")
-        api_key = os.environ.get("OPENAI_API_KEY")
-        self.llm_enabled = bool(llm or api_key)
-        self.llm_model = llm_model
-        if api_key:
-            masked = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 12 else "set"
-        else:
-            masked = "missing"
-        print(f"[LLM] enabled={self.llm_enabled}, key={masked}, model={self.llm_model}, flag={llm}")
 
         self.ring_buffer = deque(maxlen=int(5.0 / self.dt))
         self.no_feasible_steps = 0
         self.last_event = None
-        self.llm_triggered = False
         self.first_zero_step = None
         self.current_zero_streak = 0
         self.max_zero_streak = 0
         self.dominant_constraint_counts = {}
         self.near_miss = False
         self.collided = False
+        self.s2_triggered = False  # Track if S2 has already triggered
+        # For S1: track key moments for screenshots
+        self.s1_start_saved = False
+        self.s1_approaching_saved = False
+        self.s1_collision_saved = False
+        self.s1_collision_step = None
+        self.s1_post_collision_saved = False
     def _apply_config_override(self, config_path: str):
         """Override S1 config from a JSON file."""
         with open(config_path, "r", encoding="utf-8") as f:
@@ -354,35 +360,93 @@ class ScenarioRunner:
     def _build_top_k(self, candidates, cost_expl, feasibility, current_state, k=5):
         id_to_cand = {c["id"]: c for c in candidates}
         id_to_audit = {r.candidate_id: r for r in feasibility.candidate_results}
-        top = []
-        for cand_id, cost in cost_expl["scores"][:k]:
+        
+        # For S2, ensure we include feasible candidates in top_k
+        # Strategy: collect all candidates with their costs, prioritize feasible ones
+        all_candidates = []
+        feasible_candidates = []
+        
+        for cand_id, cost in cost_expl["scores"]:
             audit = id_to_audit[cand_id]
             terms, _ = self._build_cost_terms(id_to_cand[cand_id], current_state, self.scenario.cost_weights)
-            top.append({
+            cand_entry = {
                 "candidate_id": cand_id,
                 "action": id_to_cand[cand_id]["action"].tolist(),
                 "cost_total": cost,
                 "is_feasible": audit.is_feasible,
                 "slack_vector": {v.constraint_name: -float(v.violation_amount) for v in audit.violations},
                 "cost_terms": terms,
-            })
-        return top
+            }
+            all_candidates.append(cand_entry)
+            if audit.is_feasible:
+                feasible_candidates.append(cand_entry)
+        
+        # For S2: If feasible candidates exist, ensure they're in top-k
+        if self.scenario.name == "s2" and feasible_candidates:
+            # Sort feasible by cost
+            feasible_candidates.sort(key=lambda x: x["cost_total"])
+            # Sort all by cost
+            all_candidates.sort(key=lambda x: x["cost_total"])
+            
+            # Build top-k: include best feasible ones first, then fill with best overall
+            top = []
+            feasible_added = set()
+            
+            # Add best feasible candidates first
+            for fea_cand in feasible_candidates[:min(3, len(feasible_candidates))]:
+                top.append(fea_cand)
+                feasible_added.add(fea_cand["candidate_id"])
+            
+            # Add remaining best candidates (by cost) until we reach k
+            for cand in all_candidates:
+                if len(top) >= k:
+                    break
+                if cand["candidate_id"] not in feasible_added:
+                    top.append(cand)
+            
+            # Final sort by cost
+            top.sort(key=lambda x: x["cost_total"])
+            return top[:k]
+        else:
+            # For S1 or when no feasible candidates: just take top-k by cost
+            all_candidates.sort(key=lambda x: x["cost_total"])
+            return all_candidates[:k]
 
     def _find_safer_alternative(self, top_k: List[Dict]) -> Tuple[Optional[Dict], Optional[int]]:
-        """Pick a safer feasible alternative (max min_obstacle_distance slack)."""
+        """
+        Pick a safer feasible alternative.
+        For S2: Find feasible candidate with better (larger) min_obstacle_distance slack than selected.
+        """
+        if not top_k:
+            return None, None
+        
+        # Get selected action (first in top_k, lowest cost)
+        selected = top_k[0]
+        selected_feasible = selected.get("is_feasible", False)
+        selected_slack = selected.get("slack_vector", {}).get("min_obstacle_distance", -float("inf"))
+        
         best = None
         best_rank = None
         best_slack = -float("inf")
+        
+        # Find feasible candidate with better obstacle distance than selected
         for idx, cand in enumerate(top_k, start=1):
-            if not cand.get("is_feasible"):
+            if not cand.get("is_feasible", False):
                 continue
+            
             slack = cand.get("slack_vector", {}).get("min_obstacle_distance", None)
             if slack is None:
                 slack = 0.0
-            if slack > best_slack:
-                best_slack = slack
-                best = cand
-                best_rank = idx
+            
+            # For S2: prefer candidate with better (larger) obstacle distance slack
+            # If selected is infeasible, any feasible is better
+            # If selected is feasible, prefer one with larger slack
+            if not selected_feasible or slack > selected_slack:
+                if slack > best_slack:
+                    best_slack = slack
+                    best = cand
+                    best_rank = idx
+        
         return best, best_rank
 
     def _velocity_to_rpm(self, velocity_cmd: np.ndarray, yaw_rate: float) -> np.ndarray:
@@ -411,11 +475,11 @@ class ScenarioRunner:
         return drone_pos
 
     def _update_moving_obstacles(self, step: int, drone_position: np.ndarray, drone_velocity: np.ndarray):
-        """Update moving obstacles (for S3: move toward drone's straight path)."""
-        if self.scenario.name != "s3" or not self.obstacle_ids:
+        """Update moving obstacles (for S2: move toward drone's straight path)."""
+        if self.scenario.name != "s2" or not self.obstacle_ids:
             return
         
-        # For S3: move obstacle toward the straight path to goal
+        # For S2: move obstacle toward the straight path to goal
         if len(self.obstacle_ids) > 0 and len(self.scenario.obstacles) > 0:
             obstacle_id = self.obstacle_ids[0]
             current_obs_pos = np.array(self.scenario.obstacles[0])
@@ -434,8 +498,8 @@ class ScenarioRunner:
             target_y = 0.0  # Straight path (y=0)
             target_z = current_obs_pos[2]
             
-            # Move obstacle toward target (FASTER movement)
-            speed = 1.2  # m/s (much faster - was 0.3)
+            # Move obstacle toward target (VERY FAST to intercept and cause collision/near-miss)
+            speed = 1.5  # m/s (very fast - to intercept drone's path and cause collision/near-miss)
             direction = np.array([target_x, target_y, target_z]) - current_obs_pos
             dist = np.linalg.norm(direction)
             if dist > 0.01:
@@ -456,7 +520,7 @@ class ScenarioRunner:
         start_time = time.time()
 
         for step in range(self.scenario.max_steps):
-            # Update moving obstacles (for S3)
+            # Update moving obstacles (for S2)
             position = state[:3]
             velocity = state[3:6]
             self._update_moving_obstacles(step, position, velocity)
@@ -533,6 +597,34 @@ class ScenarioRunner:
             collision = self._check_collision()
             if collision:
                 self.collided = True
+            
+            # For S1: Save 4 key moments (start, approaching, collision, post-collision)
+            if self.scenario.name == "s1":
+                third_target = self._third_person_target(position)
+                
+                # 1. Start photo (step 0)
+                if step == 0 and not self.s1_start_saved:
+                    self._save_frame(step, "start", third_target, mode="close")
+                    self.s1_start_saved = True
+                
+                # 2. Approaching photo (when close to obstacle but before collision)
+                if not self.s1_approaching_saved and dist_min < 1.5 and dist_min > 0.4:
+                    self._save_frame(step, "approaching", third_target, mode="close")
+                    self.s1_approaching_saved = True
+                
+                # 3. Collision photo (when collision detected or very close to obstacle)
+                if not self.s1_collision_saved:
+                    if collision or dist_min < 0.3:  # Collision or very close
+                        self._save_frame(step, "collision", third_target, mode="close")
+                        self.s1_collision_saved = True
+                        self.s1_collision_step = step
+                
+                # 4. Post-collision photo (immediately after collision or a few steps later)
+                if self.s1_collision_step is not None and not self.s1_post_collision_saved:
+                    # Save post-collision photo immediately if collision just happened, or after 3 steps
+                    if step == self.s1_collision_step + 1 or step >= self.s1_collision_step + 3:
+                        self._save_frame(step, "post_collision", third_target, mode="close")
+                        self.s1_post_collision_saved = True
             if feasibility.n_feasible == 0:
                 self.no_feasible_steps += 1
                 if self.first_zero_step is None:
@@ -555,30 +647,38 @@ class ScenarioRunner:
                     or collision
                 )
             )
-            trigger_s3 = (
-                self.scenario.name == "s3"
+            # S2 trigger: Trigger EARLY when risky action is selected while safer alternatives exist
+            # Key: Trigger BEFORE feasible set collapses, when we can still show choice error
+            # Strategy: Trigger when:
+            # 1. Feasible alternatives exist (n_feasible > 0) - CORE REQUIREMENT
+            # 2. We're approaching obstacle (dist_min < threshold)
+            # 3. Selected action shows risk (high goal cost relative to obstacle cost, or close distance)
+            # S2 trigger: MUST trigger when feasible alternatives exist to demonstrate choice error
+            # Priority: Trigger EARLY when feasible set exists AND approaching obstacle
+            # Only trigger on collision/near-miss if we haven't triggered yet with feasible set
+            trigger_s2 = (
+                self.scenario.name == "s2"
+                and not self.s2_triggered  # Only trigger once per run
                 and (
-                    collision  # Trigger on collision
-                    or (
-                        dist_min < 0.5  # Close distance
-                        and feasibility.n_feasible > 0  # MUST have feasible alternatives (S3's core requirement)
-                    )
+                    # PRIMARY: Trigger EARLY when we have feasible alternatives (THIS IS THE KEY!)
+                    # Trigger as soon as feasible set exists and we're approaching obstacle
+                    (feasibility.n_feasible > 0 and dist_min < 8.0 and step > 2)
+                    # FALLBACK: If no feasible set trigger happened, trigger on collision/near-miss
+                    or (collision or dist_min < 0.5)
                 )
             )
 
-            # Debug: print trigger condition status for S3 (every 20 steps for more frequent updates)
-            if self.scenario.name == "s3" and step % 20 == 0:
-                print(f"[S3 Debug] step={step}, dist_min={dist_min:.3f}, n_feasible={feasibility.n_feasible}, collided={collision}, trigger={trigger_s3}")
-
-            if trigger_s1 or trigger_s3:
+            if trigger_s1 or trigger_s2:
                 third_target = self._third_person_target(position)
                 trigger_paths = []
-                if self.scenario.name in ("s1", "s3") and self.gui:
+                if self.scenario.name in ("s1", "s2") and self.gui:
                     trigger_paths = [
                         self._save_frame(step, "trigger", third_target, mode="close"),
                         self._save_frame(step, "trigger", position, mode="drone"),
                     ]
-                top_k = self._build_top_k(candidates, cost_expl, feasibility, state, k=5)
+                # For S2, use larger top_k to ensure we capture feasible alternatives
+                k_size = 10 if self.scenario.name == "s2" else 5
+                top_k = self._build_top_k(candidates, cost_expl, feasibility, state, k=k_size)
                 safer_alt, safer_rank = self._find_safer_alternative(top_k)
                 decision_margin = None
                 if safer_alt is not None:
@@ -638,44 +738,10 @@ class ScenarioRunner:
                     last_tick=self.ring_buffer[-1] if self.ring_buffer else None,
                     language="ko",
                 )
-                if not self.llm_enabled:
-                    print("\n[NLG Trigger Summary]")
-                    print(event_entry["summary_text"])
-                # Optional LLM summary at trigger (only once)
-                if self.llm_enabled and not self.llm_triggered:
-                    try:
-                        print(f"\n[LLM] Calling OpenAI API (model={self.llm_model})...")
-                        print(f"[LLM] Event data: dist_min={dist_min:.3f}, n_feasible={feasibility.n_feasible}, collided={collision}")
-                        llm_prompt = build_llm_prompt(
-                            report_stub,
-                            event_entry,
-                            self.ring_buffer[-1] if self.ring_buffer else None,
-                        )
-                        llm_text = call_openai_llm(llm_prompt, model=self.llm_model)
-                        if llm_text and not llm_text.startswith("[LLM] Error"):
-                            event_entry["llm_summary_text"] = llm_text
-                            print("\n" + "="*60)
-                            print("[LLM Trigger Summary]")
-                            print("="*60)
-                            print(llm_text)
-                            print("="*60)
-                        else:
-                            print(f"\n[LLM] Failed: {llm_text}")
-                            event_entry["llm_summary_text"] = llm_text
-                        self.llm_triggered = True
-                    except Exception as e:
-                        print(f"\n[LLM] Exception during LLM call: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        event_entry["llm_summary_text"] = f"[LLM] Exception: {e}"
-                        self.llm_triggered = True
-                elif not self.llm_enabled:
-                    print("\n[LLM] Skipped (not enabled)")
-                elif not self.llm_enabled:
-                    print("\n[LLM Trigger Summary]")
-                    print("[LLM] disabled (KEY missing or --llm not set).")
                 self.logger.log_event(event_entry)
                 self.last_event = event_entry
+                if self.scenario.name == "s2":
+                    self.s2_triggered = True  # Mark as triggered to avoid multiple triggers
 
             # Step environment
             vx, vy, vz, yaw_rate = best["action"]
@@ -686,11 +752,12 @@ class ScenarioRunner:
             if terminated or truncated:
                 break
 
-        # Keep GUI open for screenshots
-        try:
-            input("Simulation finished. Press Enter to close the GUI.")
-        except KeyboardInterrupt:
-            pass
+        # Keep GUI open for screenshots (only in GUI mode)
+        if self.gui:
+            try:
+                input("Simulation finished. Press Enter to close the GUI.")
+            except KeyboardInterrupt:
+                pass
 
         self.env.close()
 
@@ -715,34 +782,18 @@ class ScenarioRunner:
         with open(self.report_path, "w", encoding="utf-8") as f:
             import json
             json.dump(report, f, ensure_ascii=False, indent=2)
-        if not self.llm_enabled:
-            print("\n[NLG Final Summary]")
-            print(report["summary_text"])
-
-        # Optional LLM summary
-        if self.llm_enabled:
-            prompt = build_llm_prompt(report, self.last_event, self.ring_buffer[-1] if self.ring_buffer else None)
-            llm_text = call_openai_llm(prompt, model=self.llm_model)
-            report["llm_summary_text"] = llm_text
-            with open(self.report_path, "w", encoding="utf-8") as f:
-                import json
-                json.dump(report, f, ensure_ascii=False, indent=2)
-            print("\n[LLM Summary]")
-            print(llm_text)
 
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run scenario (s1 or s3) with GUI.")
-    parser.add_argument("--scenario", required=True, choices=["s1", "s3"])
+    parser = argparse.ArgumentParser(description="Run scenario (s1 or s2) with GUI.")
+    parser.add_argument("--scenario", required=True, choices=["s1", "s2"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="outputs")
     parser.add_argument("--frame-interval", type=float, default=1.0)
     parser.add_argument("--frame-width", type=int, default=640)
     parser.add_argument("--frame-height", type=int, default=360)
-    parser.add_argument("--llm", action="store_true", default=False, help="Enable LLM summary (OpenAI)")
-    parser.add_argument("--llm-model", type=str, default="gpt-4o-mini")
     parser.add_argument("--config", type=str, default=None, help="Override scenario config JSON")
     parser.add_argument("--gui", action="store_true", default=False, help="Force GUI on")
     parser.add_argument("--headless", action="store_true", default=False, help="Force headless")
@@ -761,8 +812,6 @@ def main():
         frame_interval_s=args.frame_interval,
         frame_width=args.frame_width,
         frame_height=args.frame_height,
-        llm=args.llm,
-        llm_model=args.llm_model,
         gui=gui_enabled,
         config_path=args.config,
     )

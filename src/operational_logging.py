@@ -1,5 +1,16 @@
 """
 Operational logging utilities for ticks/events JSONL.
+
+Implements the Replay Contract (재현 최소 로그 계약):
+- ticks.jsonl: Continuous operational data (low-bit, every timestep)
+  Captures state, action, DWA costs, constraint stats for replay
+- events.jsonl: Event-triggered snapshots (ring buffer, Top-K, minimal relaxation)
+  Captures decision rationale and feasibility analysis at critical moments
+
+This logging schema enables post-hoc replay of autonomous decision-making
+to answer two key questions:
+1. Inevitability (불가피성): Did safe alternatives exist?
+2. Choice error (선택오류): Why was a risky action chosen despite safer alternatives?
 """
 
 import json

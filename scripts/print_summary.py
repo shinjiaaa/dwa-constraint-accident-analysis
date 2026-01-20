@@ -37,7 +37,7 @@ def print_summary(report_path: Path, events_path: Path):
 def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description="Print human-friendly XAI summaries.")
-    parser.add_argument("--scenario", required=True, choices=["s1", "s3"])
+    parser.add_argument("--scenario", required=True, choices=["s1", "s2"])
     parser.add_argument("--out", default="outputs")
     args = parser.parse_args()
 
